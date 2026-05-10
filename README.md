@@ -26,11 +26,11 @@ Instead of opening multiple websites, dealing with ads, popups, and fake downloa
 
 ### Main Interface
 
-<img width="1894" height="917" alt="Screenshot_20260510_163939" src="https://github.com/user-attachments/assets/443b6880-7c13-4a95-b5b5-bca2a936007b" />
+![Axon Home Page](https://github.com/user-attachments/assets/443b6880-7c13-4a95-b5b5-bca2a936007b)
 
 ### Download Screen
 
-<img width="1884" height="917" alt="Screenshot_20260510_163913" src="https://github.com/user-attachments/assets/2c9f8cdb-bedc-4760-af54-a4208c46593b" />
+![Axon Download Page](https://github.com/user-attachments/assets/2c9f8cdb-bedc-4760-af54-a4208c46593b)
 
 
 ---
