@@ -145,7 +145,3 @@ The goal is simple:
 > If you can access it on the internet, you should be able to download it easily.
 
 ---
-
-## License
-
-MIT License
