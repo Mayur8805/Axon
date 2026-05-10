@@ -37,3 +37,4 @@ typing_extensions==4.15.0
 uc-micro-py==2.0.0
 urllib3==2.6.3
 yt-dlp==2026.3.17
+ytmusicapi==1.12.0
