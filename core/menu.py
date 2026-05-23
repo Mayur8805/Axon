@@ -159,7 +159,6 @@ class InputApp(App):
         margin-bottom: 1;
         overflow: hidden hidden;
         scrollbar-size: 0 0;
-        scrollbar-visibility: hidden;
         scrollbar-background: black;
         scrollbar-color: black;
         scrollbar-corner-color: black;
@@ -173,7 +172,6 @@ class InputApp(App):
         background: black;
         overflow: hidden hidden;
         scrollbar-size: 0 0;
-        scrollbar-visibility: hidden;
         scrollbar-background: black;
         scrollbar-color: black;
         scrollbar-corner-color: black;
@@ -359,6 +357,7 @@ class InputApp(App):
                     status_widget.update,
                     f"[green]✓ Done![/green]\n\n[cyan]{filename}[/cyan]",
                 )
+
 
         try:
             self.download_fn(item, progress_hook=progress_hook)

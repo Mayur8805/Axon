@@ -34,11 +34,16 @@ def download(item, progress_hook=None):
         "outtmpl": os.path.join(DOWNLOAD_PATH, "%(title)s.%(ext)s"),
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "320",
+            "preferredcodec": "flac",
+            "preferredquality": "0",
         }],
-        "quiet": True,
-        "no_warnings": True,
+        "postprocessor_args": {
+            "FFmpegExtractAudio": [
+                "-compression_level", "8",    # FLAC compression 8 (smaller file, same quality)
+            ]
+        },
+        "quiet": False,
+        "no_warnings": False,
     }
     if progress_hook:
         ydl_opts["progress_hooks"] = [progress_hook]
