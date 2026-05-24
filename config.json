@@ -1,0 +1,16 @@
+{
+  "youtubemusic": {
+    "preferredcodec": {
+      "flac": false,
+      "opus": true,
+      "mp3": false
+    }
+  },
+  "youtubeformusic": {
+    "preferredcodec": {
+      "flac": true,
+      "opus": false,
+      "mp3": false
+    }
+  }
+}
