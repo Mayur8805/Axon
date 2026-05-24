@@ -9,7 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 import yt_dlp
 
-from core.menu import get_input
+from core.menu import get_input, load_config, save_config
 
 # ── Config ───────────────────────────────────────────────────────────────────
 YT_SEARCH_BASE = "https://www.youtube.com/results?search_query="
@@ -17,6 +17,8 @@ YT_WATCH_BASE  = "https://www.youtube.com/watch?v="
 FORMAT_STRING  = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
 DOWNLOAD_PATH  = "./Downloads/Audio"
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+SETTINGS_KEY = "youtubeformusic"
+CODEC_OPTIONS = ["flac", "opus", "mp3"]
 
 HEADERS = {
     "User-Agent": (
@@ -27,37 +29,109 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+def _codec_config(selected_codec):
+    return {codec: codec == selected_codec for codec in CODEC_OPTIONS}
 
 # ── Download function (passed into TUI) ──────────────────────────────────────
-def download_audio(item: dict, progress_hook=None) -> None:
+def download_audio(item: dict, progress_hook=None, settings=None) -> None:
     """Download the selected item as MP3. Called from the TUI's background thread."""
     video_id = item.get("video_id", "")
     url      = f"{YT_WATCH_BASE}{video_id}"
+    codec = (settings or {}).get("selected", "flac")
 
-    ydl_opts = {
-        "format": FORMAT_STRING,
-        "outtmpl": os.path.join(DOWNLOAD_PATH, "%(title)s.%(ext)s"),
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "320",
-        }],
-        "quiet": True,
-        "no_warnings": True,
-    }
+    ydl_opts = build_audio_options(codec, progress_hook=progress_hook)
+    
     if progress_hook:
         ydl_opts["progress_hooks"] = [progress_hook]
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
+def settings_fn(action, settings=None):
+    config = load_config()
+    youtube_config = config.setdefault(SETTINGS_KEY, {})
+    codec_config = youtube_config.setdefault(
+        "preferredcodec",
+        {"flac": True, "opus": False, "mp3": False},
+    )
 
+    selected = next((codec for codec in CODEC_OPTIONS if codec_config.get(codec)), "flac")
 
+    if action == "load":
+        return {
+            "title": "Settings",
+            "label": "Preferred codec",
+            "options": CODEC_OPTIONS,
+            "selected": selected,
+        }
+
+    if action == "save" and settings:
+        selected = settings.get("selected", "flac")
+        youtube_config["preferredcodec"] = _codec_config(selected)
+        save_config(config)
+
+def build_audio_options(codec, progress_hook=None):
+    ydl_opts = {
+        "outtmpl": os.path.join(DOWNLOAD_PATH, "%(title)s.%(ext)s"),
+        "quiet": False,
+        "no_warnings": False,
+    }
+
+    if codec == "opus":
+        ydl_opts.update(
+            {
+                "format": "bestaudio[ext=webm]/bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "opus",
+                    "preferredquality": "0",
+                }],
+            }
+        )
+    elif codec == "flac":
+        ydl_opts.update(
+            {
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "flac",
+                    "preferredquality": "0",
+                }],
+                "postprocessor_args": {
+                    "FFmpegExtractAudio": [
+                        "-compression_level", "8",
+                    ]
+                },
+            }
+        )
+    else:
+        ydl_opts.update(
+            {
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "0",
+                }],
+                "postprocessor_args": {
+                    "FFmpegExtractAudio": [
+                        "-q:a", "0",
+                        "-compression_level", "0",
+                    ]
+                },
+            }
+        )
+
+    if progress_hook:
+        ydl_opts["progress_hooks"] = [progress_hook]
+
+    return ydl_opts
 # ── Entry point ───────────────────────────────────────────────────────────────
 def youtube_audio_scraper() -> None:
     get_input(
         msg="Search for a song or artist",
         fetch_fn=scrape_results,
         download_fn=download_audio,
+        setting_fn=settings_fn,
     )
 
 

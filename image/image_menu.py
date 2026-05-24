@@ -1,7 +1,7 @@
 from core.menu import select_option
 
 def image_menu():
-    selected = select_option(["DuckDuckGo", "GoogleImages", "Alphacoders", "4kwallpapers"], True)
+    selected = select_option(["DuckDuckGo", "GoogleImages", "Alphacoders", "4kwallpapers", "Pinterest"], True)
 
     if selected == 0:
         from image.duckduckgo_search import duckduckgo_search_scraper
@@ -17,3 +17,7 @@ def image_menu():
     elif selected == 3:
         from image._4kwallpapers import _4kwallpapers_scraper
         _4kwallpapers_scraper()
+    
+    elif selected == 4:
+        from image.pinterest import pinterest_scraper
+        pinterest_scraper()

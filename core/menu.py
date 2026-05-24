@@ -1,11 +1,23 @@
 from __future__ import annotations
-from textual.app import App
-from textual.widgets import Static, Input
-from rich.panel import Panel
-from rich.align import Align
-from textual.containers import Center, Middle,Vertical
-from rich.box import ROUNDED
+
+import inspect
+import io
+import json
+import os
+import threading
+from pathlib import Path
+from typing import Callable
+
+import httpx
 import pyfiglet
+from PIL import Image as PILImage
+from rich.align import Align
+from rich.box import ROUNDED
+from rich.panel import Panel
+from textual.app import App, ComposeResult
+from textual.containers import Container, Vertical
+from textual.widgets import Input, Static
+from textual_image.widget import Image as TextualImage
 
 class KeyApp(App):
     def __init__(self, options, panel = True):
@@ -53,39 +65,21 @@ class KeyApp(App):
 
         self.update_ui()
 
-"""
-core/menu.py  —  Textual TUI with:
-  • Left  panel : search input + results list (blue border)
-  • Right top   : thumbnail rendered as Rich pixel art
-  • Right bottom: download status / progress (blue border, Textual widget)
-"""
-
-"""
-core/menu.py  —  Textual TUI with:
-  • Left  panel : search input + results list (blue border)
-  • Right top   : thumbnail rendered as Unicode block art inside a Textual widget
-  • Right bottom: download status / progress (blue border, Textual widget)
-
-  Works on any terminal (GNOME Terminal, xterm, etc.) — renders thumbnails
-  as Rich pixel segments inside a Textual Static widget.
-"""
-
-"""
-core/menu.py
-"""
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
 
-import io
-import os
-import threading
-from typing import Callable
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
 
-import httpx
-from PIL import Image as PILImage
-from textual.app import App, ComposeResult
-from textual.widgets import Input, Static
-from textual.containers import Container, Vertical
-from textual_image.widget import Image as TextualImage
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_config(config: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
 def _load_thumbnail(url: str) -> PILImage.Image | None:
@@ -104,55 +98,92 @@ def _load_thumbnail(url: str) -> PILImage.Image | None:
 
 class InputApp(App):
 
+    BINDINGS = [
+        ("ctrl+comma", "focus_settings", "Focus settings"),
+        ("ctrl+s", "focus_settings", "Focus settings"),
+        ("f2", "focus_settings", "Focus settings"),
+    ]
+
     CSS = """
     Screen {
         background: black;
-        layout: horizontal;
+        layout: vertical;
         overflow: hidden hidden;
     }
 
-    #left {
-        width: 55%;
-        height: 100%;
+    #search_bar {
+        width: 100%;
+        height: 3;
         padding: 0 1;
-        align: center top;
     }
-
-    Input {
-        width: 80%;
-        border: round #1e90ff;
-        background: black;
-        color: white;
-        padding: 0 2;
-        margin-bottom: 1;
-    }
-    Input:focus { border: round #1e90ff; }
 
     #msg {
         width: 100%;
-        margin-bottom: 1;
+        height: 2;
+        padding: 0 1;
+        color: white;
     }
 
-    #results {
+    Input {
+        width: 100%;
+        border: round #1e90ff;
+        background: black;
+        color: white;
+    }
+    Input:focus { border: round #1e90ff; }
+
+    #main_grid {
+        width: 100%;
+        height: 1fr;
+        layout: horizontal;
+        align: left top;
+        padding: 0 1 1 1;
+    }
+
+    #left {
+        width: 50%;
+        height: 100%;
+        layout: vertical;
+        align: left top;
+        padding-right: 1;
+    }
+
+    #results_box {
         width: 100%;
         height: 1fr;
         border: round #1e90ff;
         padding: 0 1;
         background: black;
         color: white;
+        margin-bottom: 1;
+    }
+
+    #results {
+        width: 100%;
+        height: 1fr;
+    }
+
+    #settings_box {
+        width: 100%;
+        height: 1fr;
+        border: round #1e90ff;
+        background: black;
+        color: white;
+        padding: 0 1;
     }
 
     #right {
-        width: 45%;
+        width: 50%;
         height: 100%;
-        padding: 0 1;
         layout: vertical;
+        align: left top;
+        padding-left: 1;
         overflow: hidden hidden;
     }
 
     #thumb_box {
         width: 100%;
-        height: 22;
+        height: 1fr;
         border: round #1e90ff;
         background: black;
         padding: 0 1;
@@ -201,30 +232,86 @@ class InputApp(App):
         old_query: str = "",
         fetch_fn: Callable | None = None,
         download_fn: Callable | None = None,
+        setting_fn: Callable | None = None,
     ):
         super().__init__()
         self.msg_text      = msg
         self.old_query     = old_query
         self.fetch_fn      = fetch_fn
         self.download_fn   = download_fn
+        self.setting_fn    = setting_fn
         self.items: list[dict] = []
         self.selected: int     = 0
         self._last_thumb_url   = ""
+        self.focus_mode        = "search"
+        self.settings_state    = self._load_settings_state()
+        self._settings_dirty   = False
+        self._fetching         = False
+
+    def _load_settings_state(self) -> dict:
+        if not self.setting_fn:
+            return {}
+
+        settings = self.setting_fn(action="load") or {}
+        options = settings.get("options", [])
+        selected = settings.get("selected")
+        if options and selected not in options:
+            settings["selected"] = options[0]
+        return settings
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="left"):
+        with Container(id="search_bar"):
             yield Input(value=self.old_query, placeholder="Search YouTube…")
-            yield Static(self.msg_text, id="msg")
-            yield Static("", id="results")
 
-        with Vertical(id="right"):
-            with Container(id="thumb_box"):
-                yield TextualImage(id="thumb_image")
-                yield Static("[dim]No thumbnail[/dim]", id="thumb_message")
-            yield Static("[dim]No download yet.[/dim]", id="status_box")
+        yield Static(self.msg_text, id="msg")
+
+        with Container(id="main_grid"):
+            with Vertical(id="left"):
+                with Container(id="results_box"):
+                    yield Static("", id="results")
+                yield Static("", id="settings_box")
+
+            with Vertical(id="right"):
+                with Container(id="thumb_box"):
+                    yield TextualImage(id="thumb_image")
+                    yield Static("[dim]No thumbnail[/dim]", id="thumb_message")
+                yield Static("[dim]No download yet.[/dim]", id="status_box")
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
+        self._refresh_settings()
+
+    def on_unmount(self) -> None:
+        self._save_settings_if_needed()
+
+    def _refresh_settings(self) -> None:
+        widget = self.query_one("#settings_box", Static)
+        if not self.settings_state:
+            widget.update("[dim]No settings available[/dim]")
+            return
+
+        title = self.settings_state.get("title", "Settings")
+        label = self.settings_state.get("label", "Options")
+        selected = self.settings_state.get("selected")
+        lines = [f"[bold]{title}[/bold]", "", label]
+
+        for option in self.settings_state.get("options", []):
+            is_selected = option == selected
+            marker = ">" if is_selected else " "
+            color = "#63b3ff" if self.focus_mode == "settings" and is_selected else ("#1e90ff" if is_selected else "white")
+            lines.append(f"[{color}]{marker} {option}[/{color}]")
+
+        if self.setting_fn:
+            lines.extend(["", "[dim]Ctrl+, Ctrl+S, or F2 to focus settings[/dim]", "[dim]Use Up/Down and Enter[/dim]"])
+
+        widget.update("\n".join(lines))
+
+    def _save_settings_if_needed(self) -> None:
+        if not self.setting_fn or not self._settings_dirty:
+            return
+
+        self.setting_fn(action="save", settings=self.settings_state)
+        self._settings_dirty = False
 
     # ── search ───────────────────────────────────────────────────────────────
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -233,22 +320,65 @@ class InputApp(App):
             self.query_one("#msg", Static).update("[red]Please enter something[/red]")
             return
         if self.fetch_fn:
+            self.items = []
+            self.selected = 0
+            self._last_thumb_url = ""
+            self.query_one("#results", Static).update("")
+            self._set_thumb_message("[dim]No thumbnail[/dim]")
+            self.query_one(Input).disabled = True
+            self._fetching = True
             self.query_one("#msg", Static).update("[yellow]Fetching…[/yellow]")
-            self.call_later(self._run_fetch, value)
+            threading.Thread(target=self._run_fetch, args=(value,), daemon=True).start()
         else:
             self.exit(value)
 
     def _run_fetch(self, value: str) -> None:
-        self.items = self.fetch_fn(value) or []
+        try:
+            kwargs = {}
+            if "on_result" in inspect.signature(self.fetch_fn).parameters:
+                kwargs["on_result"] = self._queue_result
+            results = self.fetch_fn(value, **kwargs) or []
+            self.call_from_thread(self._finish_fetch, results)
+        except Exception as exc:
+            self.call_from_thread(
+                self.query_one("#msg", Static).update,
+                f"[red]Fetch failed:[/red] {exc}",
+            )
+            self.call_from_thread(self._unlock_search)
+
+    def _queue_result(self, item: dict) -> None:
+        self.call_from_thread(self._append_result, item)
+
+    def _append_result(self, item: dict) -> None:
+        self.items.append(item)
+        if len(self.items) == 1:
+            self.selected = 0
+            self.query_one("#msg", Static).update(
+                "[green]↑ ↓ to pick  |  Enter to download  |  Esc to search again[/green]"
+            )
+        self._refresh_results()
+
+    def _finish_fetch(self, results: list[dict]) -> None:
+        if not self.items:
+            self.items = results
+
+        self._fetching = False
         if not self.items:
             self.query_one("#msg", Static).update("[red]No results found[/red]")
+            self._unlock_search()
             return
-        self.selected = 0
-        self.query_one(Input).disabled = True
+
+        self.selected = min(self.selected, len(self.items) - 1)
         self.query_one("#msg", Static).update(
             "[green]↑ ↓ to pick  |  Enter to download  |  Esc to search again[/green]"
         )
         self._refresh_results()
+
+    def _unlock_search(self) -> None:
+        self._fetching = False
+        inp = self.query_one(Input)
+        inp.disabled = False
+        inp.focus()
 
     # ── results ───────────────────────────────────────────────────────────────
     def _refresh_results(self) -> None:
@@ -263,6 +393,7 @@ class InputApp(App):
                 lines.append(f"  [white]{title}[/white][dim]{dur_s}[/dim]")
         self.query_one("#results", Static).update("\n".join(lines))
         self._trigger_thumb()
+        self._refresh_settings()
 
     # ── thumbnail ─────────────────────────────────────────────────────────────
     def _set_thumb_message(self, message: str) -> None:
@@ -308,10 +439,30 @@ class InputApp(App):
         threading.Thread(target=_worker, daemon=True).start()
 
     # ── keyboard ──────────────────────────────────────────────────────────────
+    def action_focus_settings(self) -> None:
+        if not self.setting_fn:
+            return
+
+        self.focus_mode = "settings"
+        self._refresh_settings()
+
     def on_key(self, event) -> None:
+        key = event.key
+
+        if self.focus_mode == "settings":
+            if key in {"up", "down"}:
+                self._move_setting(-1 if key == "up" else 1)
+            elif key == "enter":
+                self.focus_mode = "results" if self.items else "search"
+                self._refresh_settings()
+            elif key == "escape":
+                self.focus_mode = "results" if self.items else "search"
+                self._refresh_settings()
+            return
+
         if not self.items:
             return
-        key = event.key
+
         if key == "up":
             self.selected = (self.selected - 1) % len(self.items)
             self._refresh_results()
@@ -322,6 +473,19 @@ class InputApp(App):
             self._start_download()
         elif key == "escape":
             self._reset_to_search()
+
+    def _move_setting(self, direction: int) -> None:
+        options = self.settings_state.get("options", [])
+        if not options:
+            return
+
+        current = self.settings_state.get("selected")
+        index = options.index(current) if current in options else 0
+        self.settings_state["selected"] = options[(index + direction) % len(options)]
+
+        self._settings_dirty = True
+        self._save_settings_if_needed()
+        self._refresh_settings()
 
     # ── download ──────────────────────────────────────────────────────────────
     def _start_download(self) -> None:
@@ -360,7 +524,10 @@ class InputApp(App):
 
 
         try:
-            self.download_fn(item, progress_hook=progress_hook)
+            kwargs = {"progress_hook": progress_hook}
+            if "settings" in inspect.signature(self.download_fn).parameters:
+                kwargs["settings"] = self.settings_state
+            self.download_fn(item, **kwargs)
         except Exception as exc:
             self.call_from_thread(
                 status_widget.update,
@@ -372,32 +539,19 @@ class InputApp(App):
         self.items           = []
         self.selected        = 0
         self._last_thumb_url = ""
+        self._fetching       = False
         self.query_one("#results", Static).update("")
         self._set_thumb_message("[dim]No thumbnail[/dim]")
         self.query_one("#status_box", Static).update("[dim]No download yet.[/dim]")
         self.query_one("#msg", Static).update(self.msg_text)
-        inp = self.query_one(Input)
-        inp.disabled = False
-        inp.focus()
+        self._unlock_search()
+        self.focus_mode = "search"
+        self._refresh_settings()
 
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Public helpers
 # ════════════════════════════════════════════════════════════════════════════
-
-def get_input(
-    msg: str = "",
-    old_query: str = "",
-    fetch_fn: Callable | None = None,
-    download_fn: Callable | None = None,
-):
-    app = InputApp(
-        msg=msg, old_query=old_query,
-        fetch_fn=fetch_fn, download_fn=download_fn,
-    )
-    return app.run()
-
-
 
 def select_option(options: list, msg: str = "Select an option"):
     """Simple wrapper: show a static list and return the chosen item."""
@@ -421,12 +575,14 @@ def select_option(options, panel_show):
  
 def get_input(msg: str = "", old_query: str = "",
               fetch_fn: Callable | None = None,
-              download_fn: Callable | None = None):
+              download_fn: Callable | None = None,
+              setting_fn: Callable | None = None):
     """
     Launch the TUI and return whatever the user confirmed.
     If download_fn is provided, downloading happens inside the TUI and
     this function returns the selected item dict when the TUI exits.
     """
     app = InputApp(msg=msg, old_query=old_query,
-                   fetch_fn=fetch_fn, download_fn=download_fn)
+                   fetch_fn=fetch_fn, download_fn=download_fn,
+                   setting_fn=setting_fn)
     return app.run()
