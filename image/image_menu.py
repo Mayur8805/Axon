@@ -1,7 +1,10 @@
-from core.menu import select_option
+from core.menu import is_back, select_option
 
 def image_menu():
     selected = select_option(["DuckDuckGo", "GoogleImages", "Alphacoders", "4kwallpapers", "Pinterest"], True)
+
+    if is_back(selected):
+        return
 
     if selected == 0:
         from image.duckduckgo_search import duckduckgo_search_scraper

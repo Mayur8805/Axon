@@ -1,8 +1,8 @@
 {
   "youtubemusic": {
     "preferredcodec": {
-      "flac": false,
-      "opus": true,
+      "flac": true,
+      "opus": false,
       "mp3": false
     }
   },
@@ -11,6 +11,12 @@
       "flac": true,
       "opus": false,
       "mp3": false
+    }
+  },
+  "instagram": {
+    "media": {
+      "image": true,
+      "video": true
     }
   }
 }

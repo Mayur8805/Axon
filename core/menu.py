@@ -19,7 +19,20 @@ from textual.containers import Container, Vertical
 from textual.widgets import Input, Static
 from textual_image.widget import Image as TextualImage
 
+BACK = "__AXON_BACK__"
+BACK_KEYS = {"alt+left", "ctrl+backspace", "ctrl+h"}
+
+
+def is_back(value) -> bool:
+    return value == BACK
+
+
 class KeyApp(App):
+    BINDINGS = [
+        ("alt+left", "go_back", "Back"),
+        ("ctrl+backspace", "go_back", "Back"),
+    ]
+
     def __init__(self, options, panel = True):
         super().__init__()
         self.options = options
@@ -38,7 +51,7 @@ class KeyApp(App):
     def compose(self):
         if self.panel_show:
             yield Static(self.panel) 
-        yield Static("[yellow]↑ ↓ to move | Enter to select[/yellow]")
+        yield Static("[yellow]↑ ↓ to move | Enter to select | Alt+Left / Ctrl+Backspace to go back[/yellow]")
 
         self.menu = Static()
         yield self.menu
@@ -55,8 +68,13 @@ class KeyApp(App):
                 text += f"  {opt}\n"
         self.menu.update(text)
 
+    def action_go_back(self) -> None:
+        self.exit(BACK)
+
     def on_key(self, event):
-        if event.key == "up":
+        if event.key in BACK_KEYS:
+            self.exit(BACK)
+        elif event.key == "up":
             self.selected = (self.selected - 1) % len(self.options)
         elif event.key == "down":
             self.selected = (self.selected + 1) % len(self.options)
@@ -102,6 +120,8 @@ class InputApp(App):
         ("ctrl+comma", "focus_settings", "Focus settings"),
         ("ctrl+s", "focus_settings", "Focus settings"),
         ("f2", "focus_settings", "Focus settings"),
+        ("alt+left", "go_back", "Back"),
+        ("ctrl+backspace", "go_back", "Back"),
     ]
 
     CSS = """
@@ -232,6 +252,7 @@ class InputApp(App):
         old_query: str = "",
         fetch_fn: Callable | None = None,
         download_fn: Callable | None = None,
+        direct_download_fn: Callable | None = None,
         setting_fn: Callable | None = None,
     ):
         super().__init__()
@@ -239,6 +260,7 @@ class InputApp(App):
         self.old_query     = old_query
         self.fetch_fn      = fetch_fn
         self.download_fn   = download_fn
+        self.direct_download_fn = direct_download_fn
         self.setting_fn    = setting_fn
         self.items: list[dict] = []
         self.selected: int     = 0
@@ -253,6 +275,11 @@ class InputApp(App):
             return {}
 
         settings = self.setting_fn(action="load") or {}
+        if settings.get("type") == "toggles":
+            settings.setdefault("cursor", 0)
+            settings.setdefault("values", {})
+            return settings
+
         options = settings.get("options", [])
         selected = settings.get("selected")
         if options and selected not in options:
@@ -292,6 +319,25 @@ class InputApp(App):
 
         title = self.settings_state.get("title", "Settings")
         label = self.settings_state.get("label", "Options")
+        if self.settings_state.get("type") == "toggles":
+            values = self.settings_state.get("values", {})
+            options = self.settings_state.get("options", [])
+            cursor = self.settings_state.get("cursor", 0)
+            lines = [f"[bold]{title}[/bold]", "", label]
+
+            for index, option in enumerate(options):
+                enabled = bool(values.get(option, False))
+                marker = ">" if index == cursor else " "
+                value = "true" if enabled else "false"
+                color = "#63b3ff" if self.focus_mode == "settings" and index == cursor else "white"
+                lines.append(f"[{color}]{marker} {option}: {value}[/{color}]")
+
+            if self.setting_fn:
+                lines.extend(["", "[dim]Ctrl+, Ctrl+S, or F2 to focus settings[/dim]", "[dim]Use Up/Down and Enter[/dim]"])
+
+            widget.update("\n".join(lines))
+            return
+
         selected = self.settings_state.get("selected")
         lines = [f"[bold]{title}[/bold]", "", label]
 
@@ -329,6 +375,12 @@ class InputApp(App):
             self._fetching = True
             self.query_one("#msg", Static).update("[yellow]Fetching…[/yellow]")
             threading.Thread(target=self._run_fetch, args=(value,), daemon=True).start()
+        elif self.direct_download_fn:
+            self.query_one(Input).disabled = True
+            self.query_one("#msg", Static).update("[yellow]Downloading…[/yellow]")
+            self.query_one("#results", Static).update(f"[#1e90ff]▶ {value}[/#1e90ff]")
+            self._set_thumb_message("[dim]No thumbnail[/dim]")
+            self._start_direct_download(value)
         else:
             self.exit(value)
 
@@ -439,6 +491,9 @@ class InputApp(App):
         threading.Thread(target=_worker, daemon=True).start()
 
     # ── keyboard ──────────────────────────────────────────────────────────────
+    def action_go_back(self) -> None:
+        self.exit(BACK)
+
     def action_focus_settings(self) -> None:
         if not self.setting_fn:
             return
@@ -449,12 +504,23 @@ class InputApp(App):
     def on_key(self, event) -> None:
         key = event.key
 
+        if key in BACK_KEYS:
+            self.exit(BACK)
+            return
+
+        if key == "escape" and not self.items:
+            self._reset_to_search()
+            return
+
         if self.focus_mode == "settings":
             if key in {"up", "down"}:
                 self._move_setting(-1 if key == "up" else 1)
             elif key == "enter":
-                self.focus_mode = "results" if self.items else "search"
-                self._refresh_settings()
+                if self.settings_state.get("type") == "toggles":
+                    self._toggle_setting()
+                else:
+                    self.focus_mode = "results" if self.items else "search"
+                    self._refresh_settings()
             elif key == "escape":
                 self.focus_mode = "results" if self.items else "search"
                 self._refresh_settings()
@@ -475,6 +541,16 @@ class InputApp(App):
             self._reset_to_search()
 
     def _move_setting(self, direction: int) -> None:
+        if self.settings_state.get("type") == "toggles":
+            options = self.settings_state.get("options", [])
+            if not options:
+                return
+
+            cursor = self.settings_state.get("cursor", 0)
+            self.settings_state["cursor"] = (cursor + direction) % len(options)
+            self._refresh_settings()
+            return
+
         options = self.settings_state.get("options", [])
         if not options:
             return
@@ -482,6 +558,23 @@ class InputApp(App):
         current = self.settings_state.get("selected")
         index = options.index(current) if current in options else 0
         self.settings_state["selected"] = options[(index + direction) % len(options)]
+
+        self._settings_dirty = True
+        self._save_settings_if_needed()
+        self._refresh_settings()
+
+    def _toggle_setting(self) -> None:
+        options = self.settings_state.get("options", [])
+        if not options:
+            return
+
+        cursor = self.settings_state.get("cursor", 0)
+        option = options[cursor]
+        values = self.settings_state.setdefault("values", {})
+        values[option] = not bool(values.get(option, False))
+
+        if not any(values.get(item, False) for item in options):
+            values[option] = True
 
         self._settings_dirty = True
         self._save_settings_if_needed()
@@ -501,22 +594,44 @@ class InputApp(App):
         else:
             self.exit((self.selected, item))
 
-    def _download_thread(self, item: dict, status_widget: Static) -> None:
+    def _start_direct_download(self, value: str) -> None:
+        status = self.query_one("#status_box", Static)
+        status.update("[yellow]⏳ Starting download…[/yellow]")
+        threading.Thread(
+            target=self._download_thread,
+            args=({"query": value}, status, self.direct_download_fn, True),
+            daemon=True,
+        ).start()
+
+    def _download_thread(
+        self,
+        item: dict,
+        status_widget: Static,
+        download_fn: Callable | None = None,
+        unlock_when_done: bool = False,
+    ) -> None:
+        download_fn = download_fn or self.download_fn
+
         def progress_hook(d: dict) -> None:
             if d["status"] == "downloading":
                 pct      = d.get("_percent_str", "?%").strip()
                 speed    = d.get("_speed_str", "?/s").strip()
                 eta      = d.get("_eta_str", "?s").strip()
-                filename = os.path.basename(d.get("filename", ""))
-                msg = (
-                    f"[cyan]{filename}[/cyan]\n\n"
-                    f"  [green]{pct}[/green]\n"
-                    f"  Speed : [white]{speed}[/white]\n"
-                    f"  ETA   : [white]{eta}[/white]"
-                )
+                raw_filename = d.get("filename", "")
+                filename = raw_filename if d.get("display_full_path") else os.path.basename(raw_filename)
+                if not pct and not eta:
+                    msg = f"[cyan]{filename}[/cyan]\n\n[dim]{speed}[/dim]"
+                else:
+                    msg = (
+                        f"[cyan]{filename}[/cyan]\n\n"
+                        f"  [green]{pct}[/green]\n"
+                        f"  Speed : [white]{speed}[/white]\n"
+                        f"  ETA   : [white]{eta}[/white]"
+                    )
                 self.call_from_thread(status_widget.update, msg)
             elif d["status"] == "finished":
-                filename = os.path.basename(d.get("filename", ""))
+                raw_filename = d.get("filename", "")
+                filename = raw_filename if d.get("display_full_path") else os.path.basename(raw_filename)
                 self.call_from_thread(
                     status_widget.update,
                     f"[green]✓ Done![/green]\n\n[cyan]{filename}[/cyan]",
@@ -525,14 +640,17 @@ class InputApp(App):
 
         try:
             kwargs = {"progress_hook": progress_hook}
-            if "settings" in inspect.signature(self.download_fn).parameters:
+            if "settings" in inspect.signature(download_fn).parameters:
                 kwargs["settings"] = self.settings_state
-            self.download_fn(item, **kwargs)
+            download_fn(item, **kwargs)
         except Exception as exc:
             self.call_from_thread(
                 status_widget.update,
                 f"[red]✗ Failed:[/red]\n{exc}",
             )
+        finally:
+            if unlock_when_done:
+                self.call_from_thread(self._unlock_search)
 
     # ── reset ─────────────────────────────────────────────────────────────────
     def _reset_to_search(self) -> None:
@@ -576,6 +694,7 @@ def select_option(options, panel_show):
 def get_input(msg: str = "", old_query: str = "",
               fetch_fn: Callable | None = None,
               download_fn: Callable | None = None,
+              direct_download_fn: Callable | None = None,
               setting_fn: Callable | None = None):
     """
     Launch the TUI and return whatever the user confirmed.
@@ -584,5 +703,6 @@ def get_input(msg: str = "", old_query: str = "",
     """
     app = InputApp(msg=msg, old_query=old_query,
                    fetch_fn=fetch_fn, download_fn=download_fn,
+                   direct_download_fn=direct_download_fn,
                    setting_fn=setting_fn)
     return app.run()

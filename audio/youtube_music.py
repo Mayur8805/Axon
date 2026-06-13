@@ -78,6 +78,7 @@ def build_audio_options(codec, progress_hook=None):
                     "preferredcodec": "opus",
                     "preferredquality": "0",
                 }],
+                "cookiesfrombrowser": ("firefox",),
             }
         )
     elif codec == "mp3":
@@ -95,6 +96,7 @@ def build_audio_options(codec, progress_hook=None):
                         "-compression_level", "0",
                     ]
                 },
+                "cookiesfrombrowser": ("firefox",),
             }
         )
     else:
@@ -111,6 +113,7 @@ def build_audio_options(codec, progress_hook=None):
                         "-compression_level", "8",
                     ]
                 },
+                "cookiesfrombrowser": ("firefox",),
             }
         )
 
