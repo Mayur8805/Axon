@@ -100,14 +100,29 @@ def save_config(config: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
-def _load_thumbnail(url: str) -> PILImage.Image | None:
+# ── PATCH: replace _load_thumbnail in core/menu.py with this version ─────────
+# It handles both http(s):// URLs and local file paths
+
+def _load_thumbnail(url: str) -> "PILImage.Image | None":
     if not url:
         return None
 
     try:
+        # Local file path (absolute or file:// prefix)
+        if url.startswith("file://"):
+            path = url[7:]
+        elif url.startswith("/") or (len(url) > 1 and url[1] == ":"):
+            path = url
+        else:
+            path = None
+
+        if path:
+            with PILImage.open(path) as image:
+                return image.convert("RGBA").copy()
+
+        # Remote URL
         resp = httpx.get(url, timeout=30)
         resp.raise_for_status()
-
         with PILImage.open(io.BytesIO(resp.content)) as image:
             return image.convert("RGBA").copy()
 
@@ -269,6 +284,9 @@ class InputApp(App):
         self.settings_state    = self._load_settings_state()
         self._settings_dirty   = False
         self._fetching         = False
+        self._editing_text_field = None
+        self._pending_text_field = None
+        self._search_placeholder = msg or "Search…"
 
     def _load_settings_state(self) -> dict:
         if not self.setting_fn:
@@ -278,6 +296,9 @@ class InputApp(App):
         if settings.get("type") == "toggles":
             settings.setdefault("cursor", 0)
             settings.setdefault("values", {})
+            text_values = settings.setdefault("text_values", {})
+            for field in settings.get("text_fields", []):
+                text_values.setdefault(field["key"], field.get("default", ""))
             return settings
 
         options = settings.get("options", [])
@@ -288,7 +309,7 @@ class InputApp(App):
 
     def compose(self) -> ComposeResult:
         with Container(id="search_bar"):
-            yield Input(value=self.old_query, placeholder="Search YouTube…")
+            yield Input(value=self.old_query, placeholder=self._search_placeholder)
 
         yield Static(self.msg_text, id="msg")
 
@@ -323,6 +344,19 @@ class InputApp(App):
             values = self.settings_state.get("values", {})
             options = self.settings_state.get("options", [])
             cursor = self.settings_state.get("cursor", 0)
+            text_values = self.settings_state.get("text_values", {})
+            visible_fields = []
+            for field in self.settings_state.get("text_fields", []):
+                when = field.get("when")
+                if when and not values.get(when):
+                    continue
+                visible_fields.append(field)
+            self.settings_state["_visible_text_fields"] = visible_fields
+            total_rows = len(options) + len(visible_fields)
+            if cursor >= total_rows:
+                self.settings_state["cursor"] = max(0, total_rows - 1)
+                cursor = self.settings_state["cursor"]
+
             lines = [f"[bold]{title}[/bold]", "", label]
 
             for index, option in enumerate(options):
@@ -331,6 +365,14 @@ class InputApp(App):
                 value = "true" if enabled else "false"
                 color = "#63b3ff" if self.focus_mode == "settings" and index == cursor else "white"
                 lines.append(f"[{color}]{marker} {option}: {value}[/{color}]")
+
+            for index, field in enumerate(visible_fields):
+                row = len(options) + index
+                marker = ">" if cursor == row else " "
+                current = text_values.get(field["key"], "")
+                display = current if current else "[dim]not set[/dim]"
+                color = "#63b3ff" if self.focus_mode == "settings" and cursor == row else "white"
+                lines.append(f"[{color}]{marker} {field['label']}: {display}[/{color}]")
 
             if self.setting_fn:
                 lines.extend(["", "[dim]Ctrl+, Ctrl+S, or F2 to focus settings[/dim]", "[dim]Use Up/Down and Enter[/dim]"])
@@ -362,6 +404,21 @@ class InputApp(App):
     # ── search ───────────────────────────────────────────────────────────────
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()
+        if self._editing_text_field:
+            if not value:
+                return
+            self.settings_state.setdefault("text_values", {})[self._editing_text_field] = value
+            self._editing_text_field = None
+            self._pending_text_field = None
+            self._settings_dirty = True
+            self._save_settings_if_needed()
+            self.focus_mode = "settings"
+            event.input.placeholder = self._search_placeholder
+            event.input.value = ""
+            self.query_one("#msg", Static).update("[green]Settings updated[/green]")
+            self._refresh_settings()
+            return
+
         if not value:
             self.query_one("#msg", Static).update("[red]Please enter something[/red]")
             return
@@ -504,6 +561,11 @@ class InputApp(App):
     def on_key(self, event) -> None:
         key = event.key
 
+        if self.focus_mode == "text_edit":
+            if key in BACK_KEYS or key == "escape":
+                self._cancel_text_field_edit()
+            return
+
         if key in BACK_KEYS:
             self.exit(BACK)
             return
@@ -517,7 +579,12 @@ class InputApp(App):
                 self._move_setting(-1 if key == "up" else 1)
             elif key == "enter":
                 if self.settings_state.get("type") == "toggles":
-                    self._toggle_setting()
+                    cursor = self.settings_state.get("cursor", 0)
+                    options = self.settings_state.get("options", [])
+                    if cursor < len(options):
+                        self._toggle_setting()
+                    else:
+                        self._start_text_field_edit(cursor - len(options))
                 else:
                     self.focus_mode = "results" if self.items else "search"
                     self._refresh_settings()
@@ -540,14 +607,56 @@ class InputApp(App):
         elif key == "escape":
             self._reset_to_search()
 
+    def _cancel_text_field_edit(self) -> None:
+        self._editing_text_field = None
+        self._pending_text_field = None
+        inp = self.query_one(Input)
+        inp.placeholder = self._search_placeholder
+        inp.value = ""
+        self.focus_mode = "settings"
+        self.query_one("#msg", Static).update(self.msg_text)
+        self._refresh_settings()
+
+    def _start_text_field_edit(self, field_index: int) -> None:
+        visible_fields = self.settings_state.get("_visible_text_fields", [])
+        if field_index < 0 or field_index >= len(visible_fields):
+            return
+
+        field = visible_fields[field_index]
+        text_values = self.settings_state.setdefault("text_values", {})
+        self._pending_text_field = field["key"]
+        self._editing_text_field = field["key"]
+        self.focus_mode = "text_edit"
+        self.query_one("#msg", Static).update("[yellow]Enter value, then press Enter[/yellow]")
+
+        def _focus_input() -> None:
+            if self._pending_text_field != field["key"]:
+                return
+            inp = self.query_one(Input)
+            inp.disabled = False
+            inp.value = text_values.get(field["key"], "")
+            inp.placeholder = field.get("placeholder", field["label"])
+            inp.focus()
+
+        self.set_timer(0.05, _focus_input)
+
     def _move_setting(self, direction: int) -> None:
         if self.settings_state.get("type") == "toggles":
             options = self.settings_state.get("options", [])
             if not options:
                 return
 
+            visible_fields = []
+            values = self.settings_state.get("values", {})
+            for field in self.settings_state.get("text_fields", []):
+                when = field.get("when")
+                if when and not values.get(when):
+                    continue
+                visible_fields.append(field)
+
             cursor = self.settings_state.get("cursor", 0)
-            self.settings_state["cursor"] = (cursor + direction) % len(options)
+            total = len(options) + len(visible_fields)
+            self.settings_state["cursor"] = (cursor + direction) % total
             self._refresh_settings()
             return
 
@@ -576,30 +685,82 @@ class InputApp(App):
         if not any(values.get(item, False) for item in options):
             values[option] = True
 
+        for group in self.settings_state.get("exclusive_groups", []):
+            if option not in group:
+                continue
+            if values.get(option):
+                for other in group:
+                    if other != option:
+                        values[other] = False
+            elif not any(values.get(item) for item in group):
+                values[option] = True
+
         self._settings_dirty = True
         self._save_settings_if_needed()
         self._refresh_settings()
 
     # ── download ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _needs_terminal(download_fn: Callable | None) -> bool:
+        return bool(download_fn and getattr(download_fn, "needs_terminal", False))
+
+    def _restore_terminal_ui(self) -> None:
+        self.refresh(repaint=True)
+        self._refresh_settings()
+        if self.items:
+            self._refresh_results()
+        self.query_one(Input).focus()
+
+    def _run_terminal_download(
+        self,
+        item: dict,
+        status_widget: Static,
+        download_fn: Callable,
+        unlock_when_done: bool = False,
+    ) -> None:
+        try:
+            kwargs: dict = {}
+            if "settings" in inspect.signature(download_fn).parameters:
+                kwargs["settings"] = self.settings_state
+
+            with self.suspend():
+                download_fn(item, **kwargs)
+
+            status_widget.update("[green]✓ Done![/green]")
+        except Exception as exc:
+            status_widget.update(f"[red]✗ Failed:[/red]\n{exc}")
+        finally:
+            self._restore_terminal_ui()
+            if unlock_when_done:
+                self._unlock_search()
+
     def _start_download(self) -> None:
         item   = self.items[self.selected]
         status = self.query_one("#status_box", Static)
         status.update("[yellow]⏳ Starting download…[/yellow]")
         if self.download_fn:
-            threading.Thread(
-                target=self._download_thread,
-                args=(item, status),
-                daemon=True,
-            ).start()
+            if self._needs_terminal(self.download_fn):
+                self._run_terminal_download(item, status, self.download_fn)
+            else:
+                threading.Thread(
+                    target=self._download_thread,
+                    args=(item, status),
+                    daemon=True,
+                ).start()
         else:
             self.exit((self.selected, item))
 
     def _start_direct_download(self, value: str) -> None:
         status = self.query_one("#status_box", Static)
         status.update("[yellow]⏳ Starting download…[/yellow]")
+        item = {"query": value}
+        if self._needs_terminal(self.direct_download_fn):
+            self._run_terminal_download(item, status, self.direct_download_fn, unlock_when_done=True)
+            return
+
         threading.Thread(
             target=self._download_thread,
-            args=({"query": value}, status, self.direct_download_fn, True),
+            args=(item, status, self.direct_download_fn, True),
             daemon=True,
         ).start()
 
