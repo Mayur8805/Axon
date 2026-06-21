@@ -284,6 +284,8 @@ class InputApp(App):
         self.settings_state    = self._load_settings_state()
         self._settings_dirty   = False
         self._fetching         = False
+        self._fetch_cancel_event = threading.Event()
+        self._fetch_generation = 0
         self._editing_text_field = None
         self._pending_text_field = None
         self._search_placeholder = msg or "Search…"
@@ -423,6 +425,10 @@ class InputApp(App):
             self.query_one("#msg", Static).update("[red]Please enter something[/red]")
             return
         if self.fetch_fn:
+            self._fetch_cancel_event.set()
+            self._fetch_cancel_event = threading.Event()
+            self._fetch_generation += 1
+            generation = self._fetch_generation
             self.items = []
             self.selected = 0
             self._last_thumb_url = ""
@@ -431,7 +437,7 @@ class InputApp(App):
             self.query_one(Input).disabled = True
             self._fetching = True
             self.query_one("#msg", Static).update("[yellow]Fetching…[/yellow]")
-            threading.Thread(target=self._run_fetch, args=(value,), daemon=True).start()
+            threading.Thread(target=self._run_fetch, args=(value, generation), daemon=True).start()
         elif self.direct_download_fn:
             self.query_one(Input).disabled = True
             self.query_one("#msg", Static).update("[yellow]Downloading…[/yellow]")
@@ -441,24 +447,47 @@ class InputApp(App):
         else:
             self.exit(value)
 
-    def _run_fetch(self, value: str) -> None:
+    def _run_fetch(self, value: str, generation: int) -> None:
+        cancel_event = self._fetch_cancel_event
+
         try:
             kwargs = {}
-            if "on_result" in inspect.signature(self.fetch_fn).parameters:
-                kwargs["on_result"] = self._queue_result
+            parameters = inspect.signature(self.fetch_fn).parameters
+            if "on_result" in parameters:
+                kwargs["on_result"] = lambda item: self._queue_result(item, generation)
+            if "cancel_event" in parameters:
+                kwargs["cancel_event"] = cancel_event
             results = self.fetch_fn(value, **kwargs) or []
-            self.call_from_thread(self._finish_fetch, results)
+            self.call_from_thread(self._finish_fetch, results, generation)
         except Exception as exc:
+            if cancel_event.is_set() or generation != self._fetch_generation:
+                return
             self.call_from_thread(
                 self.query_one("#msg", Static).update,
                 f"[red]Fetch failed:[/red] {exc}",
             )
             self.call_from_thread(self._unlock_search)
 
-    def _queue_result(self, item: dict) -> None:
-        self.call_from_thread(self._append_result, item)
+    def _queue_result(self, item: dict, generation: int) -> None:
+        if generation != self._fetch_generation or self._fetch_cancel_event.is_set():
+            return
+        self.call_from_thread(self._append_result_if_current, item, generation)
+
+    def _append_result_if_current(self, item: dict, generation: int) -> None:
+        if generation != self._fetch_generation or self._fetch_cancel_event.is_set():
+            return
+        self._append_result(item)
 
     def _append_result(self, item: dict) -> None:
+        incoming_key = item.get("_result_key") if isinstance(item, dict) else None
+        if incoming_key:
+            for index, existing in enumerate(self.items):
+                existing_key = existing.get("_result_key") if isinstance(existing, dict) else None
+                if existing_key == incoming_key:
+                    self.items[index] = item
+                    self._refresh_results()
+                    return
+
         self.items.append(item)
         if len(self.items) == 1:
             self.selected = 0
@@ -467,7 +496,10 @@ class InputApp(App):
             )
         self._refresh_results()
 
-    def _finish_fetch(self, results: list[dict]) -> None:
+    def _finish_fetch(self, results: list[dict], generation: int) -> None:
+        if generation != self._fetch_generation or self._fetch_cancel_event.is_set():
+            return
+
         if not self.items:
             self.items = results
 
@@ -482,6 +514,13 @@ class InputApp(App):
             "[green]↑ ↓ to pick  |  Enter to download  |  Esc to search again[/green]"
         )
         self._refresh_results()
+
+        values = self.settings_state.get("values", {}) if isinstance(self.settings_state, dict) else {}
+        if bool(values.get("download all", False)) and self.download_fn:
+            self.query_one("#msg", Static).update(
+                "[green]Download all is enabled. Starting download...[/green]"
+            )
+            self._start_download()
 
     def _unlock_search(self) -> None:
         self._fetching = False
@@ -685,6 +724,10 @@ class InputApp(App):
         if not any(values.get(item, False) for item in options):
             values[option] = True
 
+        for group in self.settings_state.get("required_groups", []):
+            if option in group and not any(values.get(item, False) for item in group):
+                values[option] = True
+
         for group in self.settings_state.get("exclusive_groups", []):
             if option not in group:
                 continue
@@ -735,7 +778,14 @@ class InputApp(App):
                 self._unlock_search()
 
     def _start_download(self) -> None:
-        item   = self.items[self.selected]
+        values = self.settings_state.get("values", {}) if isinstance(self.settings_state, dict) else {}
+        if bool(values.get("download all", False)):
+            item = {
+                "title": "Download all",
+                "_download_all_items": list(self.items),
+            }
+        else:
+            item = self.items[self.selected]
         status = self.query_one("#status_box", Static)
         status.update("[yellow]⏳ Starting download…[/yellow]")
         if self.download_fn:
@@ -815,6 +865,8 @@ class InputApp(App):
 
     # ── reset ─────────────────────────────────────────────────────────────────
     def _reset_to_search(self) -> None:
+        self._fetch_cancel_event.set()
+        self._fetch_generation += 1
         self.items           = []
         self.selected        = 0
         self._last_thumb_url = ""

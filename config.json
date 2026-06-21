@@ -1,9 +1,9 @@
 {
   "youtubemusic": {
     "preferredcodec": {
-      "flac": false,
+      "flac": true,
       "opus": false,
-      "mp3": true
+      "mp3": false
     }
   },
   "youtubeformusic": {
@@ -15,15 +15,16 @@
   },
   "instagram": {
     "media": {
-      "image": false,
-      "video": true
-    }
+      "image": true,
+      "video": false
+    },
+    "download_all": true
   },
   "anime": {
     "720p": false,
     "1080p": true,
     "dub": true,
-    "episode": false,
-    "episode_range": "2"
+    "episode": true,
+    "episode_range": ""
   }
 }

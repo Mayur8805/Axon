@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import shutil
 import string
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from core.menu import get_input, load_config, save_config
@@ -12,6 +16,8 @@ from core.menu import get_input, load_config, save_config
 
 SETTINGS_KEY  = "instagram"
 MEDIA_OPTIONS = ["image", "video"]
+DOWNLOAD_ALL_OPTION = "download all"
+SETTING_OPTIONS = [*MEDIA_OPTIONS, DOWNLOAD_ALL_OPTION]
 DOWNLOAD_PATH = "./Downloads/Instagram"
 COOKIES_FILE  = Path(__file__).resolve().parent.parent / "instagram_cookies.txt"
 DEBUG_LOG     = Path(__file__).resolve().parent.parent / "instagram_debug.log"
@@ -34,22 +40,32 @@ def instagram_scraper() -> None:
 # ── settings ──────────────────────────────────────────────────────────────────
 
 def settings_fn(action, settings=None):
+    
     config           = load_config()
     instagram_config = config.setdefault(SETTINGS_KEY, {})
     media_config     = instagram_config.setdefault("media", {"image": True, "video": True})
+    download_all     = bool(instagram_config.get("download_all", False))
+    if not any(bool(media_config.get(opt, False)) for opt in MEDIA_OPTIONS):
+        media_config["image"] = True
 
     if action == "load":
         return {
             "type":    "toggles",
             "title":   "Settings",
             "label":   "Download media",
-            "options": MEDIA_OPTIONS,
-            "values":  {opt: bool(media_config.get(opt, False)) for opt in MEDIA_OPTIONS},
+            "options": SETTING_OPTIONS,
+            "required_groups": [MEDIA_OPTIONS],
+            "values":  {
+                "image": bool(media_config.get("image", False)),
+                "video": bool(media_config.get("video", False)),
+                DOWNLOAD_ALL_OPTION: download_all,
+            },
         }
 
     if action == "save" and settings:
         values = settings.get("values", {})
         instagram_config["media"] = {opt: bool(values.get(opt, False)) for opt in MEDIA_OPTIONS}
+        instagram_config["download_all"] = bool(values.get(DOWNLOAD_ALL_OPTION, False))
         save_config(config)
 
 
@@ -76,6 +92,10 @@ def _build_instagram_url(query: str) -> str:
     return f"https://www.instagram.com/{v.lstrip('@').strip('/')}/"
 
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm"}
+
+
 def _gallery_dl_filter(values: dict) -> str:
     images = bool(values.get("image", False))
     videos = bool(values.get("video", False))
@@ -84,22 +104,119 @@ def _gallery_dl_filter(values: dict) -> str:
     if images:
         return "extension in ('jpg', 'jpeg', 'png', 'webp')"
     if videos:
-        return "extension in ('mp4', 'mov')"
+        return "extension in ('mp4', 'mov', 'm4v', 'webm')"
     return ""
+
+
+def _gallery_dl_options(values: dict) -> list[str]:
+    videos = bool(values.get("video", False))
+    return ["--option", f"extractor.instagram.videos={'true' if videos else 'false'}"]
 
 
 def _cookies_args() -> list[str]:
     return [f"--cookies={COOKIES_FILE}"] if COOKIES_FILE.exists() else []
 
 
+def _allowed_exts(values: dict) -> set[str]:
+    exts: set[str] = set()
+    if values.get("image", False):
+        exts.update(IMAGE_EXTS)
+    if values.get("video", False):
+        exts.update(VIDEO_EXTS)
+    return exts
+
+
+def _safe_cache_name(key: str, suffix: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in key)
+    return f"{safe}{suffix}"
+
+
+def _copy_to_cache(src: Path, key: str) -> str:
+    dest = THUMB_CACHE / _safe_cache_name(key, src.suffix)
+    shutil.copy2(src, dest)
+    return str(dest)
+
+
+def _media_type(path: Path) -> str:
+    return "video" if path.suffix.lower() in VIDEO_EXTS else "image"
+
+
+def _read_meta(media_path: Path) -> dict:
+    json_path = media_path.with_suffix(media_path.suffix + ".json")
+    if not json_path.exists():
+        return {}
+
+    try:
+        return json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _item_from_media(media_path: Path, sequence: int, total_by_post: int | None = None) -> dict:
+    meta = _read_meta(media_path)
+
+    shortcode = (
+        meta.get("post_shortcode")
+        or meta.get("shortcode")
+        or meta.get("sidecar_shortcode")
+        or ""
+    )
+    description = meta.get("description") or meta.get("caption") or ""
+    post_id_raw = meta.get("post_id") or meta.get("sidecar_media_id") or ""
+
+    if not shortcode and post_id_raw and str(post_id_raw).isdigit():
+        shortcode = _id_to_shortcode(str(post_id_raw))
+
+    if not shortcode:
+        stem_parts = media_path.stem.split("_")
+        if stem_parts and stem_parts[0].isdigit():
+            shortcode = _id_to_shortcode(stem_parts[0])
+
+    post_url = f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""
+    media_kind = _media_type(media_path)
+    media_id = (
+        meta.get("media_id")
+        or meta.get("sidecar_media_id")
+        or meta.get("id")
+        or media_path.stem
+    )
+    media_key = f"{shortcode or media_path.stem}:{media_id}:{media_kind}"
+
+    cached_media = _copy_to_cache(media_path, media_key)
+    thumbnail = cached_media if media_kind == "image" else ""
+
+    short_desc = (description[:55] + "...") if len(description) > 55 else description
+    base_title = media_path.name if media_kind == "video" else (short_desc or post_url or media_path.name)
+    if total_by_post and total_by_post > 1:
+        title = f"{base_title}  [{sequence}/{total_by_post} {media_kind}]"
+    else:
+        title = f"{base_title}  [{media_kind}]"
+
+    return {
+        "title":       title,
+        "url":         post_url,
+        "thumbnail":   thumbnail,
+        "shortcode":   shortcode,
+        "date":        str(meta.get("post_date") or meta.get("date") or ""),
+        "_meta":       meta,
+        "_urls":       [post_url] if post_url else [],
+        "_count":      1,
+        "_base_title": base_title,
+        "_media_type": media_kind,
+        "_media_id":   str(media_id),
+        "_source_path": cached_media,
+        "_result_key": media_key,
+        "_sequence":   sequence,
+    }
+
+
 # ── fetch ─────────────────────────────────────────────────────────────────────
 
-def fetch_instagram_posts(query: str, on_result=None) -> list[dict]:
+def fetch_instagram_posts(query: str, on_result=None, cancel_event=None) -> list[dict]:
     """
-    Download all media + JSON sidecars into a tmp dir.
-    Use the first downloaded image of each post as its thumbnail (file path).
-    Group carousel posts by post_shortcode.
-    Stream results to on_result as each post's first image arrives.
+    Download media + JSON sidecars into a tmp dir and stream each media item
+    as soon as gallery-dl finishes writing it. Carousel posts are exposed as
+    separate selectable entries so Enter downloads the selected media only.
     """
     DEBUG_LOG.write_text("", encoding="utf-8")
 
@@ -109,131 +226,154 @@ def fetch_instagram_posts(query: str, on_result=None) -> list[dict]:
     THUMB_CACHE.mkdir(parents=True, exist_ok=True)
 
     url = _build_instagram_url(query)
+    values = settings_fn("load").get("values", {"image": True, "video": True})
+    media_filter = _gallery_dl_filter(values)
+    allowed_exts = _allowed_exts(values)
     _log(f"[fetch] URL: {url}")
+
+    if not allowed_exts:
+        err = _err_item("Enable image or video in settings.")
+        if on_result:
+            on_result(err)
+        return [err]
 
     with tempfile.TemporaryDirectory(prefix="axon_ig_") as tmp:
         command = [
             "gallery-dl",
             *_cookies_args(),
+            *_gallery_dl_options(values),
             "--write-info-json",
             "--directory", tmp,
-            "--filter", "extension in ('jpg', 'jpeg', 'png', 'webp')",
             url,
         ]
+        if media_filter:
+            command[-1:-1] = ["--filter", media_filter]
         _log(f"[fetch] cmd: {' '.join(command)}")
 
         try:
-            proc = subprocess.run(command, capture_output=True, text=True)
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
         except FileNotFoundError:
             err = _err_item("❌ gallery-dl not found.")
             if on_result:
                 on_result(err)
             return [err]
 
-        _log(f"[fetch] rc={proc.returncode}")
-        if proc.stderr.strip():
-            _log(f"[fetch] stderr: {proc.stderr.strip()[:300]}")
+        items: list[dict] = []
+        seen: set[Path] = set()
+        seen_result_indices: dict[str, int] = {}
+        stdout_lines: list[str] = []
+        tmp_path = Path(tmp)
+        output_queue: "queue.Queue[str]" = queue.Queue()
 
-        # ── collect all image files and their sidecar JSONs ──────────────────
-        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
-        image_files = sorted(
-            f for f in Path(tmp).rglob("*")
-            if f.is_file() and f.suffix.lower() in image_exts
-        )
-        _log(f"[fetch] image files found: {len(image_files)}")
+        def read_output() -> None:
+            if not proc.stdout:
+                return
+            for output_line in proc.stdout:
+                output_queue.put(output_line)
 
-        if not image_files:
-            _log("[fetch] no images — falling back to filename lines")
-            return _parse_filename_lines(proc.stdout, on_result)
+        threading.Thread(target=read_output, daemon=True).start()
 
-        # ── group images by post_shortcode from sidecar JSON ─────────────────
-        posts:  dict[str, dict] = {}   # shortcode → item
-        order:  list[str]       = []
+        def collect_ready_files() -> None:
+            if cancel_event and cancel_event.is_set():
+                return
 
-        for img_path in image_files:
-            json_path = img_path.with_suffix(img_path.suffix + ".json")
-            meta: dict = {}
-            if json_path.exists():
+            media_files = sorted(
+                f for f in tmp_path.rglob("*")
+                if f.is_file() and f.suffix.lower() in allowed_exts and f not in seen
+            )
+            for media_path in media_files:
+                if cancel_event and cancel_event.is_set():
+                    return
+
                 try:
-                    meta = json.loads(json_path.read_text(encoding="utf-8"))
-                except Exception:
-                    pass
+                    size_before = media_path.stat().st_size
+                    time.sleep(0.03)
+                    if media_path.stat().st_size != size_before:
+                        continue
+                except OSError:
+                    continue
 
-            # Log all keys once for debugging
-            if not posts:
-                _log(f"[meta keys] {list(meta.keys())}")
-
-            # ── pull fields using the actual key names from the log ──────────
-            shortcode   = (
-                meta.get("post_shortcode")
-                or meta.get("shortcode")
-                or meta.get("sidecar_shortcode")
-                or ""
-            )
-            description = (
-                meta.get("description")
-                or meta.get("caption")
-                or ""
-            )
-            post_id_raw = (
-                meta.get("post_id")
-                or meta.get("sidecar_media_id")
-                or ""
-            )
-            date = str(meta.get("post_date") or meta.get("date") or "")
-
-            # Derive shortcode from post_id if still missing
-            if not shortcode and post_id_raw and str(post_id_raw).isdigit():
-                shortcode = _id_to_shortcode(str(post_id_raw))
-
-            # Fall back to filename stem's first segment
-            if not shortcode:
-                stem  = img_path.stem          # e.g. 3380927807287979486_3380927793673218846
-                parts = stem.split("_")
-                if parts[0].isdigit():
-                    shortcode = _id_to_shortcode(parts[0])
-
-            post_url   = f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""
-            short_desc = (description[:55] + "…") if len(description) > 55 else description
-            title      = short_desc or post_url or img_path.name
-
-            _log(f"[img] {img_path.name}  sc={shortcode}  desc={description[:40]!r}")
-
-            key = shortcode or img_path.stem
-
-            if key not in posts:
-                # Copy first image of this post to the persistent thumb cache
-                thumb_dest = THUMB_CACHE / f"{key}{img_path.suffix}"
-                try:
-                    shutil.copy2(img_path, thumb_dest)
-                    thumbnail = str(thumb_dest)
-                except Exception:
-                    thumbnail = ""
-
-                item = {
-                    "title":       title,
-                    "url":         post_url,
-                    "thumbnail":   thumbnail,   # local file path
-                    "shortcode":   shortcode,
-                    "date":        date,
-                    "_meta":       meta,
-                    "_urls":       [post_url] if post_url else [],
-                    "_count":      1,
-                    "_base_title": title,
-                }
-                posts[key] = item
-                order.append(key)
-
+                seen.add(media_path)
+                item = _item_from_media(media_path, len(items) + 1)
+                result_key = item.get("_result_key", "")
+                if result_key in seen_result_indices:
+                    items[seen_result_indices[result_key]] = item
+                else:
+                    seen_result_indices[result_key] = len(items)
+                    items.append(item)
+                _log(f"[media] {media_path.name} type={item['_media_type']} sc={item['shortcode']}")
                 if on_result:
                     on_result(item)
-            else:
-                # Carousel: just increment count and update title
-                posts[key]["_count"] += 1
-                count = posts[key]["_count"]
-                posts[key]["title"] = f"{posts[key]['_base_title']}  [{count} photos]"
 
-        items = [posts[k] for k in order]
-        _log(f"[fetch] total posts: {len(items)}")
+        while proc.poll() is None:
+            if cancel_event and cancel_event.is_set():
+                _log("[fetch] cancelled; terminating gallery-dl")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    _log("[fetch] terminate timed out; killing gallery-dl")
+                    proc.kill()
+                    proc.wait()
+                return items
+
+            while True:
+                try:
+                    line = output_queue.get_nowait()
+                except queue.Empty:
+                    break
+                stdout_lines.append(line)
+                _log(f"[gallery-dl] {line.strip()}")
+            collect_ready_files()
+            time.sleep(0.1)
+
+        while True:
+            try:
+                line = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                stdout_lines.append(line)
+                _log(f"[gallery-dl] {line.strip()}")
+        collect_ready_files()
+
+        rc = proc.wait()
+        _log(f"[fetch] rc={rc}")
+
+        per_post: dict[str, int] = {}
+        for item in items:
+            key = item.get("shortcode") or item.get("url") or item.get("_result_key", "")
+            per_post[key] = per_post.get(key, 0) + 1
+
+        post_seen: dict[str, int] = {}
+        for item in items:
+            key = item.get("shortcode") or item.get("url") or item.get("_result_key", "")
+            post_seen[key] = post_seen.get(key, 0) + 1
+            count = per_post.get(key, 1)
+            if count > 1:
+                item["_sequence"] = post_seen[key]
+                item["title"] = f"{item['_base_title']}  [{post_seen[key]}/{count} {item['_media_type']}]"
+                if on_result:
+                    on_result(item)
+
+        if not items:
+            if media_filter:
+                _log("[fetch] no media matched selected filters")
+                err = _err_item("No matching media found for selected image/video settings.")
+                if on_result:
+                    on_result(err)
+                return [err]
+
+            _log("[fetch] no media — falling back to filename lines")
+            return _parse_filename_lines("".join(stdout_lines), on_result)
+
+        _log(f"[fetch] total media items: {len(items)}")
         return items
 
 
@@ -297,6 +437,30 @@ def _err_item(msg: str) -> dict:
 # ── download ──────────────────────────────────────────────────────────────────
 
 def download_instagram_post(item: dict, progress_hook=None, settings=None) -> None:
+    if "_download_all_items" in item:
+        download_instagram_items(item.get("_download_all_items", []), progress_hook=progress_hook)
+        return
+
+    source_path = item.get("_source_path", "")
+    if source_path and os.path.exists(source_path):
+        os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+        dest = Path(DOWNLOAD_PATH) / Path(source_path).name
+        if progress_hook:
+            progress_hook({
+                "status": "downloading", "_percent_str": "",
+                "_speed_str": "local copy", "_eta_str": "",
+                "filename": f"Saving selected {item.get('_media_type', 'media')}...",
+                "display_full_path": True,
+            })
+        shutil.copy2(source_path, dest)
+        if progress_hook:
+            progress_hook({
+                "status": "finished",
+                "filename": str(dest),
+                "display_full_path": True,
+            })
+        return
+
     post_url = item.get("url", "")
     if not post_url:
         if progress_hook:
@@ -310,7 +474,12 @@ def download_instagram_post(item: dict, progress_hook=None, settings=None) -> No
         return
 
     media_filter = _gallery_dl_filter(values)
-    command = ["gallery-dl", *_cookies_args(), "--directory", DOWNLOAD_PATH]
+    command = [
+        "gallery-dl",
+        *_cookies_args(),
+        *_gallery_dl_options(values),
+        "--directory", DOWNLOAD_PATH,
+    ]
     if media_filter:
         command.extend(["--filter", media_filter])
     command.append(post_url)
@@ -351,6 +520,44 @@ def download_instagram_post(item: dict, progress_hook=None, settings=None) -> No
         progress_hook({
             "status": "finished",
             "filename": last_line or f"Saved to {DOWNLOAD_PATH}",
+            "display_full_path": True,
+        })
+
+
+def download_instagram_items(items: list[dict], progress_hook=None) -> None:
+    downloadable = []
+    seen: set[str] = set()
+    for item in items:
+        source_path = item.get("_source_path", "") if isinstance(item, dict) else ""
+        if not source_path or not os.path.exists(source_path) or source_path in seen:
+            continue
+        seen.add(source_path)
+        downloadable.append(item)
+
+    if not downloadable:
+        if progress_hook:
+            progress_hook({"status": "finished", "filename": "No downloaded media available to save."})
+        return
+
+    os.makedirs(DOWNLOAD_PATH, exist_ok=True)
+    saved = 0
+    for index, item in enumerate(downloadable, 1):
+        source_path = item["_source_path"]
+        dest = Path(DOWNLOAD_PATH) / Path(source_path).name
+        if progress_hook:
+            progress_hook({
+                "status": "downloading", "_percent_str": f"{index}/{len(downloadable)}",
+                "_speed_str": "local copy", "_eta_str": "",
+                "filename": f"Saving {Path(source_path).name}",
+                "display_full_path": True,
+            })
+        shutil.copy2(source_path, dest)
+        saved += 1
+
+    if progress_hook:
+        progress_hook({
+            "status": "finished",
+            "filename": f"Saved {saved} file(s) to {DOWNLOAD_PATH}",
             "display_full_path": True,
         })
 
