@@ -1,16 +1,17 @@
 {
   "youtubemusic": {
     "preferredcodec": {
-      "flac": true,
+      "flac": false,
       "opus": false,
-      "mp3": false
-    }
+      "mp3": true
+    },
+    "include_thumbnail": true
   },
   "youtubeformusic": {
     "preferredcodec": {
-      "flac": true,
+      "flac": false,
       "opus": false,
-      "mp3": false
+      "mp3": true
     }
   },
   "instagram": {
@@ -18,7 +19,7 @@
       "image": true,
       "video": false
     },
-    "download_all": true
+    "download_all": false
   },
   "anime": {
     "720p": false,
@@ -26,5 +27,16 @@
     "dub": true,
     "episode": true,
     "episode_range": ""
+  },
+  "movies": {
+    "source_bot": "@SearchMoviesBot",
+    "receiver_username": "@MakwanaM8",
+    "api_id": "21644167",
+    "api_hash": "28f04cb7c3e1920ab29b12e1de07dba8"
+  },
+  "manga": {
+    "download_all": true,
+    "merge_all": true,
+    "keep_images": false
   }
 }

@@ -19,6 +19,7 @@ DOWNLOAD_PATH  = "./Downloads/Audio"
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 SETTINGS_KEY = "youtubeformusic"
 CODEC_OPTIONS = ["flac", "opus", "mp3"]
+THUMBNAIL_OPTION = "include thumbnail"
 
 HEADERS = {
     "User-Agent": (
@@ -32,20 +33,62 @@ HEADERS = {
 def _codec_config(selected_codec):
     return {codec: codec == selected_codec for codec in CODEC_OPTIONS}
 
+
+def _best_thumbnail(thumbnails):
+    if not thumbnails:
+        return None
+
+    squares = [
+        t for t in thumbnails
+        if t.get("width") and t.get("height") and t["width"] == t["height"]
+    ]
+    candidates = squares or thumbnails
+
+    def _size(t):
+        return t.get("width", 0) or 0
+
+    best = max(candidates, key=_size, default={})
+    return best.get("url")
+
+
 # ── Download function (passed into TUI) ──────────────────────────────────────
 def download_audio(item: dict, progress_hook=None, settings=None) -> None:
-    """Download the selected item as MP3. Called from the TUI's background thread."""
+    """Download the selected item as audio. Called from the TUI's background thread."""
     video_id = item.get("video_id", "")
     url      = f"{YT_WATCH_BASE}{video_id}"
-    codec = (settings or {}).get("selected", "flac")
 
-    ydl_opts = build_audio_options(codec, progress_hook=progress_hook)
-    
-    if progress_hook:
-        ydl_opts["progress_hooks"] = [progress_hook]
+    settings = settings or settings_fn("load")
+    values = settings.get("values", {})
+    codec = next(
+        (codec for codec in CODEC_OPTIONS if values.get(codec)),
+        settings.get("selected", "flac"),
+    )
+    include_thumbnail = bool(values.get(THUMBNAIL_OPTION, True))
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    ydl_opts = build_audio_options(
+        codec,
+        progress_hook=progress_hook,
+        include_thumbnail=include_thumbnail,
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except yt_dlp.utils.DownloadError:
+        if not include_thumbnail:
+            raise
+
+        # Retry once without thumbnail embedding so the song isn't lost
+        ydl_opts_fallback = build_audio_options(codec, progress_hook=progress_hook)
+        ydl_opts_fallback["writethumbnail"] = False
+        ydl_opts_fallback["postprocessors"] = [
+            pp for pp in ydl_opts_fallback["postprocessors"]
+            if pp["key"] not in ("EmbedThumbnail", "FFmpegThumbnailsConvertor")
+        ]
+        with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl:
+            ydl.download([url])
+
+
 def settings_fn(action, settings=None):
     config = load_config()
     youtube_config = config.setdefault(SETTINGS_KEY, {})
@@ -53,49 +96,75 @@ def settings_fn(action, settings=None):
         "preferredcodec",
         {"flac": True, "opus": False, "mp3": False},
     )
+    include_thumbnail = youtube_config.setdefault("include_thumbnail", True)
 
     selected = next((codec for codec in CODEC_OPTIONS if codec_config.get(codec)), "flac")
 
     if action == "load":
         return {
             "title": "Settings",
-            "label": "Preferred codec",
-            "options": CODEC_OPTIONS,
-            "selected": selected,
+            "label": "Download options",
+            "type": "toggles",
+            "options": [*CODEC_OPTIONS, THUMBNAIL_OPTION],
+            "values": {
+                **_codec_config(selected),
+                THUMBNAIL_OPTION: bool(include_thumbnail),
+            },
+            "exclusive_groups": [CODEC_OPTIONS],
+            "required_groups": [CODEC_OPTIONS],
+            "groups": [
+                {"title": "Download as", "options": CODEC_OPTIONS},
+                {"title": "Cover setting", "options": [THUMBNAIL_OPTION]},
+            ],
         }
 
     if action == "save" and settings:
-        selected = settings.get("selected", "flac")
+        values = settings.get("values", {})
+        selected = next((codec for codec in CODEC_OPTIONS if values.get(codec)), "flac")
         youtube_config["preferredcodec"] = _codec_config(selected)
+        youtube_config["include_thumbnail"] = bool(values.get(THUMBNAIL_OPTION, True))
         save_config(config)
 
-def build_audio_options(codec, progress_hook=None):
+
+def _with_thumbnail_postprocessors(postprocessors, include_thumbnail):
+    if include_thumbnail:
+        postprocessors.extend([
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
+            {"key": "EmbedThumbnail"},
+        ])
+
+    postprocessors.append({"key": "FFmpegMetadata"})
+    return postprocessors
+
+
+def build_audio_options(codec, progress_hook=None, include_thumbnail=True):
     ydl_opts = {
         "outtmpl": os.path.join(DOWNLOAD_PATH, "%(title)s.%(ext)s"),
         "quiet": False,
         "no_warnings": False,
+        "writethumbnail": include_thumbnail,
     }
 
     if codec == "opus":
         ydl_opts.update(
             {
                 "format": "bestaudio[ext=webm]/bestaudio/best",
-                "postprocessors": [{
+                "postprocessors": _with_thumbnail_postprocessors([{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "opus",
                     "preferredquality": "0",
-                }],
+                }], include_thumbnail),
             }
         )
     elif codec == "flac":
         ydl_opts.update(
             {
                 "format": "bestaudio/best",
-                "postprocessors": [{
+                "postprocessors": _with_thumbnail_postprocessors([{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "flac",
                     "preferredquality": "0",
-                }],
+                }], include_thumbnail),
                 "postprocessor_args": {
                     "FFmpegExtractAudio": [
                         "-compression_level", "8",
@@ -107,11 +176,11 @@ def build_audio_options(codec, progress_hook=None):
         ydl_opts.update(
             {
                 "format": "bestaudio/best",
-                "postprocessors": [{
+                "postprocessors": _with_thumbnail_postprocessors([{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "0",
-                }],
+                }], include_thumbnail),
                 "postprocessor_args": {
                     "FFmpegExtractAudio": [
                         "-q:a", "0",
@@ -196,11 +265,8 @@ def scrape_results(query: str, max_results: int = 10) -> list[dict]:
             if not video_id:
                 continue
 
-            thumbnails   = vr.get("thumbnail", {}).get("thumbnails", [])
-            best_thumb   = max(thumbnails,
-                               key=lambda t: (t.get("width", 0), t.get("height", 0)),
-                               default={})
-            thumbnail_url = best_thumb.get("url", "")
+            thumbnails     = vr.get("thumbnail", {}).get("thumbnails", [])
+            thumbnail_url  = _best_thumbnail(thumbnails) or ""
 
             title = "".join(
                 r.get("text", "")

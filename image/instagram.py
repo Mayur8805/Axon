@@ -227,7 +227,6 @@ def fetch_instagram_posts(query: str, on_result=None, cancel_event=None) -> list
 
     url = _build_instagram_url(query)
     values = settings_fn("load").get("values", {"image": True, "video": True})
-    media_filter = _gallery_dl_filter(values)
     allowed_exts = _allowed_exts(values)
     _log(f"[fetch] URL: {url}")
 
@@ -246,8 +245,6 @@ def fetch_instagram_posts(query: str, on_result=None, cancel_event=None) -> list
             "--directory", tmp,
             url,
         ]
-        if media_filter:
-            command[-1:-1] = ["--filter", media_filter]
         _log(f"[fetch] cmd: {' '.join(command)}")
 
         try:
@@ -363,13 +360,6 @@ def fetch_instagram_posts(query: str, on_result=None, cancel_event=None) -> list
                     on_result(item)
 
         if not items:
-            if media_filter:
-                _log("[fetch] no media matched selected filters")
-                err = _err_item("No matching media found for selected image/video settings.")
-                if on_result:
-                    on_result(err)
-                return [err]
-
             _log("[fetch] no media — falling back to filename lines")
             return _parse_filename_lines("".join(stdout_lines), on_result)
 

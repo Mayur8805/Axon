@@ -20,7 +20,7 @@ from textual.widgets import Input, Static
 from textual_image.widget import Image as TextualImage
 
 BACK = "__AXON_BACK__"
-BACK_KEYS = {"alt+left", "ctrl+backspace", "ctrl+h"}
+BACK_KEYS = {"alt+left", "ctrl+backspace", "ctrl+h", "ctrl+q"}
 
 
 def is_back(value) -> bool:
@@ -31,6 +31,7 @@ class KeyApp(App):
     BINDINGS = [
         ("alt+left", "go_back", "Back"),
         ("ctrl+backspace", "go_back", "Back"),
+        ("ctrl+q", "go_back", "Back"),
     ]
 
     def __init__(self, options, panel = True):
@@ -51,7 +52,7 @@ class KeyApp(App):
     def compose(self):
         if self.panel_show:
             yield Static(self.panel) 
-        yield Static("[yellow]↑ ↓ to move | Enter to select | Alt+Left / Ctrl+Backspace to go back[/yellow]")
+        yield Static("[yellow]↑ ↓ to move | Enter to select | Esc / Ctrl+Q to go back[/yellow]")
 
         self.menu = Static()
         yield self.menu
@@ -72,7 +73,7 @@ class KeyApp(App):
         self.exit(BACK)
 
     def on_key(self, event):
-        if event.key in BACK_KEYS:
+        if event.key in BACK_KEYS or event.key == "escape":
             self.exit(BACK)
         elif event.key == "up":
             self.selected = (self.selected - 1) % len(self.options)
@@ -108,10 +109,17 @@ def _load_thumbnail(url: str) -> "PILImage.Image | None":
         return None
 
     try:
-        # Local file path (absolute or file:// prefix)
-        if url.startswith("file://"):
+        # Only treat as a local file when it is an explicit file:// URL, a
+        # Windows drive path, or an absolute POSIX path that actually exists on
+        # disk. Everything else (http(s)://, protocol-relative //..., or
+        # site-relative /...) is fetched over the network.
+        is_file_url = url.startswith("file://")
+        is_windows_path = len(url) > 1 and url[1] == ":"
+        is_existing_posix = url.startswith("/") and "://" not in url and os.path.exists(url)
+
+        if is_file_url:
             path = url[7:]
-        elif url.startswith("/") or (len(url) > 1 and url[1] == ":"):
+        elif is_windows_path or is_existing_posix:
             path = url
         else:
             path = None
@@ -120,8 +128,11 @@ def _load_thumbnail(url: str) -> "PILImage.Image | None":
             with PILImage.open(path) as image:
                 return image.convert("RGBA").copy()
 
-        # Remote URL
-        resp = httpx.get(url, timeout=30)
+        # Remote URL — normalise protocol-relative URLs before fetching.
+        remote = url
+        if remote.startswith("//"):
+            remote = "https:" + remote
+        resp = httpx.get(remote, timeout=30, follow_redirects=True)
         resp.raise_for_status()
         with PILImage.open(io.BytesIO(resp.content)) as image:
             return image.convert("RGBA").copy()
@@ -361,12 +372,23 @@ class InputApp(App):
 
             lines = [f"[bold]{title}[/bold]", "", label]
 
+            groups = self.settings_state.get("groups")
+            group_index_for = {}
+            if groups:
+                for group in groups:
+                    for member in group.get("options", []):
+                        group_index_for[member] = group.get("title", "")
+
             for index, option in enumerate(options):
+                group_title = group_index_for.get(option)
+                if group_title and (index == 0 or group_index_for.get(options[index - 1]) != group_title):
+                    lines.append(f"[bold cyan]{group_title}[/bold cyan]")
+
                 enabled = bool(values.get(option, False))
                 marker = ">" if index == cursor else " "
-                value = "true" if enabled else "false"
+                value = "True" if enabled else "False"
                 color = "#63b3ff" if self.focus_mode == "settings" and index == cursor else "white"
-                lines.append(f"[{color}]{marker} {option}: {value}[/{color}]")
+                lines.append(f"  [{color}]{marker} {option} : {value}[/{color}]")
 
             for index, field in enumerate(visible_fields):
                 row = len(options) + index
@@ -478,6 +500,11 @@ class InputApp(App):
             return
         self._append_result(item)
 
+    def _clear_results(self) -> None:
+        self.items = []
+        self.selected = 0
+        self._refresh_results()
+
     def _append_result(self, item: dict) -> None:
         incoming_key = item.get("_result_key") if isinstance(item, dict) else None
         if incoming_key:
@@ -515,13 +542,6 @@ class InputApp(App):
         )
         self._refresh_results()
 
-        values = self.settings_state.get("values", {}) if isinstance(self.settings_state, dict) else {}
-        if bool(values.get("download all", False)) and self.download_fn:
-            self.query_one("#msg", Static).update(
-                "[green]Download all is enabled. Starting download...[/green]"
-            )
-            self._start_download()
-
     def _unlock_search(self) -> None:
         self._fetching = False
         inp = self.query_one(Input)
@@ -530,8 +550,23 @@ class InputApp(App):
 
     # ── results ───────────────────────────────────────────────────────────────
     def _refresh_results(self) -> None:
+        items = self.items
+        total = len(items)
+
+        # Only render a window of items around the current selection so the
+        # highlighted row stays visible and the list "scrolls" with the cursor.
+        window = 24
+        if total > window:
+            top = max(0, min(self.selected - window // 2, total - window))
+            visible = range(top, top + window)
+        else:
+            visible = range(total)
+
         lines: list[str] = []
-        for i, item in enumerate(self.items):
+        if total > window and visible.start > 0:
+            lines.append("  [dim]▲ more[/dim]")
+        for i in visible:
+            item = items[i]
             title = item.get("title", "?") if isinstance(item, dict) else str(item)
             dur   = item.get("duration", "") if isinstance(item, dict) else ""
             dur_s = f"  [{dur}]" if dur else ""
@@ -539,19 +574,24 @@ class InputApp(App):
                 lines.append(f"[#1e90ff]▶ {title}{dur_s}[/#1e90ff]")
             else:
                 lines.append(f"  [white]{title}[/white][dim]{dur_s}[/dim]")
+        if total > window and visible.stop < total:
+            lines.append("  [dim]▼ more[/dim]")
         self.query_one("#results", Static).update("\n".join(lines))
         self._trigger_thumb()
         self._refresh_settings()
 
     # ── thumbnail ─────────────────────────────────────────────────────────────
     def _set_thumb_message(self, message: str) -> None:
-        image_widget = self.query_one("#thumb_image", TextualImage)
-        message_widget = self.query_one("#thumb_message", Static)
-        image_widget.image = None
-        image_widget.display = False
-        image_widget.refresh(layout=True)
-        message_widget.display = True
-        message_widget.update(message)
+        try:
+            image_widget = self.query_one("#thumb_image", TextualImage)
+            message_widget = self.query_one("#thumb_message", Static)
+            image_widget.image = None
+            image_widget.display = False
+            image_widget.refresh(layout=True)
+            message_widget.display = True
+            message_widget.update(message)
+        except Exception:
+            pass
 
     def _set_thumb_image(self, url: str, image: PILImage.Image | None) -> None:
         if url != self._last_thumb_url:
@@ -561,13 +601,23 @@ class InputApp(App):
             self._set_thumb_message("[dim]Preview unavailable[/dim]")
             return
 
-        image_widget = self.query_one("#thumb_image", TextualImage)
-        message_widget = self.query_one("#thumb_message", Static)
-        image_widget.image = None
-        image_widget.refresh(layout=True)
-        image_widget.image = image
-        image_widget.display = True
-        message_widget.display = False
+        try:
+            image_widget = self.query_one("#thumb_image", TextualImage)
+            message_widget = self.query_one("#thumb_message", Static)
+            image_widget.image = None
+            image_widget.refresh(layout=True)
+            image_widget.image = image
+            image_widget.display = True
+            message_widget.display = False
+        except Exception:
+            # The terminal's image backend (e.g. no sixel/kitty support) may
+            # reject the render — fall back to a text message instead of crashing.
+            try:
+                self.query_one("#thumb_message", Static).update(
+                    "[dim]Preview unavailable[/dim]"
+                )
+            except Exception:
+                pass
 
     def _trigger_thumb(self) -> None:
         item = self.items[self.selected] if self.items else {}
@@ -721,7 +771,9 @@ class InputApp(App):
         values = self.settings_state.setdefault("values", {})
         values[option] = not bool(values.get(option, False))
 
-        if not any(values.get(item, False) for item in options):
+        if not self.settings_state.get("allow_none") and not any(
+            values.get(item, False) for item in options
+        ):
             values[option] = True
 
         for group in self.settings_state.get("required_groups", []):
@@ -783,6 +835,7 @@ class InputApp(App):
             item = {
                 "title": "Download all",
                 "_download_all_items": list(self.items),
+                "_selected_index": self.selected,
             }
         else:
             item = self.items[self.selected]
@@ -840,6 +893,18 @@ class InputApp(App):
                         f"  ETA   : [white]{eta}[/white]"
                     )
                 self.call_from_thread(status_widget.update, msg)
+            elif d["status"] == "results_clear":
+                # Drop any previous results (e.g. the manga search list) before
+                # streaming a fresh set so chapters never merge with old ones.
+                self.call_from_thread(self._clear_results)
+            elif d["status"] == "result":
+                # Streamed result (e.g. chapters discovered one by one). Append
+                # to the live list so the user sees them arrive incrementally.
+                item = d.get("item")
+                if isinstance(item, dict):
+                    self.call_from_thread(self._append_result, item)
+            elif d["status"] == "results_done":
+                self.call_from_thread(self._finish_stream)
             elif d["status"] == "finished":
                 raw_filename = d.get("filename", "")
                 filename = raw_filename if d.get("display_full_path") else os.path.basename(raw_filename)
@@ -853,7 +918,9 @@ class InputApp(App):
             kwargs = {"progress_hook": progress_hook}
             if "settings" in inspect.signature(download_fn).parameters:
                 kwargs["settings"] = self.settings_state
-            download_fn(item, **kwargs)
+            result = download_fn(item, **kwargs)
+            if isinstance(result, list):
+                self.call_from_thread(self._replace_results, result)
         except Exception as exc:
             self.call_from_thread(
                 status_widget.update,
@@ -862,6 +929,32 @@ class InputApp(App):
         finally:
             if unlock_when_done:
                 self.call_from_thread(self._unlock_search)
+
+    def _finish_stream(self) -> None:
+        self._fetching = False
+        self.selected = min(self.selected, len(self.items) - 1)
+        self._last_thumb_url = ""
+        self.query_one("#status_box", Static).update("[green]Results updated[/green]")
+        self.query_one("#msg", Static).update(
+            "[green]↑ ↓ to pick  |  Enter to download  |  Esc to search again[/green]"
+        )
+        self._refresh_results()
+        try:
+            self.query_one(Input).disabled = False
+            self.query_one(Input).focus()
+        except Exception:
+            pass
+        self._refresh_results()
+
+    def _replace_results(self, items: list[dict]) -> None:
+        self.items = items
+        self.selected = 0
+        self._last_thumb_url = ""
+        self.query_one("#status_box", Static).update("[green]Results updated[/green]")
+        self.query_one("#msg", Static).update(
+            "[green]↑ ↓ to pick  |  Enter to download  |  Esc to search again[/green]"
+        )
+        self._refresh_results()
 
     # ── reset ─────────────────────────────────────────────────────────────────
     def _reset_to_search(self) -> None:

@@ -1,7 +1,7 @@
 from core.menu import is_back, select_option
 
 while True:
-    selected = select_option(["Audio", "Video", "Anime", "Images", "PDF", "Instagram"], True)
+    selected = select_option(["Audio", "Video", "Anime", "Images", "PDF", "Instagram", "Movie", "Manga"], True)
 
     if is_back(selected):
         break
@@ -29,3 +29,11 @@ while True:
     elif selected == 5:
         from image.instagram import instagram_scraper
         instagram_scraper()
+
+    elif selected == 6:
+        from movies.movie_menu import movie_menu
+        movie_menu()
+
+    elif selected == 7:
+        from Manga.Manga_menu import manga_menu
+        manga_menu()

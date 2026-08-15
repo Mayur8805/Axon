@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import subprocess
 from myjdapi import Myjdapi
 from dotenv import load_dotenv
 from core.menu import get_input
@@ -16,9 +17,63 @@ os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 jd = Myjdapi()
 jd.set_app_key("myapp")
 
-jd.connect(email, password)
+device = None
 
-device = jd.get_device("JDownloader@makwana")
+
+JD_LAUNCHER = os.path.expanduser(
+    "~/Downloads/jdownloader/jd2/JDownloader2"
+)
+
+
+def _is_jdownloader_running() -> bool:
+    try:
+        return bool(
+            subprocess.run(
+                ["pgrep", "-f", "JDownloader.jar"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+        )
+    except Exception:
+        return False
+
+
+def _launch_jdownloader() -> None:
+    if _is_jdownloader_running() or not os.path.exists(JD_LAUNCHER):
+        return
+    subprocess.Popen(
+        ["nohup", JD_LAUNCHER],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _connect():
+    global device
+    if device is not None:
+        return device
+    try:
+        jd.connect(email, password)
+        device = jd.get_device("JDownloader@makwana")
+    except Exception:
+        device = None
+        # JDownloader is likely not running — try to launch it in the background
+        # and wait for it to come online, then retry once.
+        if not _is_jdownloader_running():
+            _launch_jdownloader()
+            for _ in range(30):
+                time.sleep(2)
+                try:
+                    jd.connect(email, password)
+                    device = jd.get_device("JDownloader@makwana")
+                    return device
+                except Exception:
+                    continue
+        raise ConnectionError(
+            "Could not connect to JDownloader. Make sure JDownloader is running "
+            "and logged in with the device 'JDownloader@makwana'."
+        )
+    return device
 
 video_ext = [".mp4",".mkv",".avi",".mov",".wmv",
              ".flv",".webm",".mpeg",".mpg",".m4v",
@@ -70,6 +125,7 @@ def _thumbnail_url(video_id):
 
 
 def clear_old_links(device):
+    device = _connect()
     links = device.linkgrabber.query_links()
     link_ids = [link["uuid"] for link in links]
     if link_ids:
@@ -81,6 +137,7 @@ def jdownloader():
 
 
 def scrap_result(query):
+    device = _connect()
     clear_old_links(device)
     device.linkgrabber.add_links(
         [{
@@ -139,6 +196,8 @@ def download_fn(item, progress_hook=None):
     video_id = item.get("video_id") if isinstance(item, dict) else item
     if not video_id:
         raise ValueError("No JDownloader link id found for the selected video")
+
+    device = _connect()
 
     # Move selected link to download list
     device.linkgrabber.move_to_downloadlist(
