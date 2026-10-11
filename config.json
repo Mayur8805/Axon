@@ -2,8 +2,8 @@
   "youtubemusic": {
     "preferredcodec": {
       "flac": false,
-      "opus": false,
-      "mp3": true
+      "opus": true,
+      "mp3": false
     },
     "include_thumbnail": true
   },
@@ -19,14 +19,14 @@
       "image": true,
       "video": false
     },
-    "download_all": false
+    "download_all": true
   },
   "anime": {
     "720p": false,
     "1080p": true,
     "dub": true,
     "episode": true,
-    "episode_range": ""
+    "episode_range": "1-12"
   },
   "movies": {
     "source_bot": "@SearchMoviesBot",

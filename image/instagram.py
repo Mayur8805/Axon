@@ -33,7 +33,7 @@ def instagram_scraper() -> None:
         "@username or Instagram URL",
         fetch_fn=fetch_instagram_posts,
         download_fn=download_instagram_post,
-        setting_fn=settings_fn,
+        setting_fn=settings_fn, 
     )
 
 
@@ -115,6 +115,19 @@ def _gallery_dl_options(values: dict) -> list[str]:
 
 def _cookies_args() -> list[str]:
     return [f"--cookies={COOKIES_FILE}"] if COOKIES_FILE.exists() else []
+
+
+# Instagram rejects gallery-dl's default Firefox UA with "useragent mismatch",
+# so we always send a current Chrome desktop UA.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _user_agent_args() -> list[str]:
+    return ["--user-agent", USER_AGENT]
 
 
 def _allowed_exts(values: dict) -> set[str]:
@@ -240,6 +253,7 @@ def fetch_instagram_posts(query: str, on_result=None, cancel_event=None) -> list
         command = [
             "gallery-dl",
             *_cookies_args(),
+            *_user_agent_args(),
             *_gallery_dl_options(values),
             "--write-info-json",
             "--directory", tmp,
@@ -467,6 +481,7 @@ def download_instagram_post(item: dict, progress_hook=None, settings=None) -> No
     command = [
         "gallery-dl",
         *_cookies_args(),
+        *_user_agent_args(),
         *_gallery_dl_options(values),
         "--directory", DOWNLOAD_PATH,
     ]

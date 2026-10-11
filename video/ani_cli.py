@@ -163,10 +163,66 @@ def settings_fn(action, settings=None):
 #     # Final success
 #     progress_hook({"status": "finished", "filename": query})
 
+# ani-cli ships a self-updater: `ani-cli -U` fetches the remote script, patches
+# in place if a newer version exists, then exits 0 immediately (it will NOT run
+# a download in the same invocation). `ani-cli -V` prints the version.
+ANI_CLI = "ani-cli"
+
+
+def _ani_cli_version(ani_cli: str) -> str:
+    """Return the installed ani-cli version string, or "" on failure."""
+    try:
+        out = subprocess.run(
+            [ani_cli, "-V"], capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return out.split()[0] if out else ""
+
+
+def _update_ani_cli(ani_cli: str) -> bool:
+    """
+    Run the ani-cli self-updater. Returns True if an update was applied or the
+    script was already up to date, False only if the update itself failed.
+    The update is best-effort: a network failure must never block a download.
+    """
+    try:
+        result = subprocess.run(
+            [ani_cli, "-U"], capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"[ani-cli] update skipped ({type(exc).__name__})")
+        return False
+
+    if result.returncode != 0:
+        print(f"[ani-cli] update failed: {(result.stderr or result.stdout).strip()[:200]}")
+        return False
+    print(f"[ani-cli] update check ok: {(result.stdout).strip()[:200]}")
+    return True
+
+
+def _ensure_ani_cli_updated(ani_cli: str) -> None:
+    """
+    Always check for an update before downloading. If a newer version exists
+    it is applied; if the script is already current we just continue. A failed
+    update never raises — the download still runs with whatever is installed.
+    """
+    before = _ani_cli_version(ani_cli)
+    _update_ani_cli(ani_cli)
+    after = _ani_cli_version(ani_cli)
+    if before and after and before != after:
+        print(f"[ani-cli] updated {before} -> {after}")
+    elif before and after and before == after:
+        print(f"[ani-cli] up to date ({before})")
+
+
 def download_anime(item: dict, progress_hook=None, settings=None) -> None:
     """
     Run ani-cli in the real terminal (TUI will suspend).
     progress_hook is ignored because the terminal is fully handed off.
+
+    The script is always self-updated first so a stale ani-cli (which is what
+    caused the earlier breakage) is patched before it is used.
     """
     query = item.get("query", "").strip()
     if not query:
@@ -183,9 +239,12 @@ def download_anime(item: dict, progress_hook=None, settings=None) -> None:
     if use_episode and not episode_range:
         raise ValueError("Set an episode range in settings (enable episode, then Enter to edit)")
 
-    ani_cli = shutil.which("ani-cli")
+    ani_cli = shutil.which(ANI_CLI)
     if not ani_cli:
-        raise FileNotFoundError("ani-cli is not installed or not on PATH")
+        raise FileNotFoundError(f"{ANI_CLI} is not installed or not on PATH")
+
+    # Always bring ani-cli up to date before using it.
+    _ensure_ani_cli_updated(ani_cli)
 
     download_dir = DOWNLOAD_BASE / _sanitize_folder_name(query)
     download_dir.mkdir(parents=True, exist_ok=True)
@@ -200,8 +259,24 @@ def download_anime(item: dict, progress_hook=None, settings=None) -> None:
     env = os.environ.copy()
     env["ANI_CLI_DOWNLOAD_DIR"] = str(download_dir.resolve())
 
-    # Run ani-cli in the foreground – this takes over the terminal completely.
-    result = subprocess.run(command, env=env, cwd=str(download_dir.resolve()))
+    # ani-cli's fzf menu needs a real TTY. When the Textual TUI suspends and
+    # hands the terminal to the child, the child's stdin is whatever the TUI
+    # was holding (a pipe, not a TTY) — fzf then prints "inappropriate ioctl
+    # for device" and hangs forever. Reattach the controlling terminal so
+    # fzf/ani-cli get a live TTY.
+    try:
+        tty = open("/dev/tty", "r")
+    except OSError:
+        tty = None
+
+    try:
+        result = subprocess.run(
+            command, env=env, cwd=str(download_dir.resolve()),
+            stdin=tty if tty is not None else None,
+        )
+    finally:
+        if tty is not None:
+            tty.close()
 
     if result.returncode != 0:
         raise RuntimeError(f"ani-cli failed with exit code {result.returncode}")

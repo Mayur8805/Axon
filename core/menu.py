@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import os
+import socket
 import threading
 from pathlib import Path
 from typing import Callable
@@ -16,7 +17,7 @@ from rich.box import ROUNDED
 from rich.panel import Panel
 from textual.app import App, ComposeResult
 from textual.containers import Container, Vertical
-from textual.widgets import Input, Static
+from textual.widgets import Input, RichLog, Static
 from textual_image.widget import Image as TextualImage
 
 BACK = "__AXON_BACK__"
@@ -25,6 +26,17 @@ BACK_KEYS = {"alt+left", "ctrl+backspace", "ctrl+h", "ctrl+q"}
 
 def is_back(value) -> bool:
     return value == BACK
+
+
+def _has_internet(timeout: float = 3.0) -> bool:
+    """Return True if the machine can reach the internet."""
+    for host in ("8.8.8.8", "1.1.1.1", "google.com"):
+        try:
+            with socket.create_connection((host, 53), timeout=timeout):
+                return True
+        except (OSError, socket.timeout):
+            continue
+    return False
 
 
 class KeyApp(App):
@@ -207,6 +219,8 @@ class InputApp(App):
     #results {
         width: 100%;
         height: 1fr;
+        background: black;
+        color: white;
     }
 
     #settings_box {
@@ -280,6 +294,7 @@ class InputApp(App):
         download_fn: Callable | None = None,
         direct_download_fn: Callable | None = None,
         setting_fn: Callable | None = None,
+        filter_fn: Callable | None = None,
     ):
         super().__init__()
         self.msg_text      = msg
@@ -288,7 +303,9 @@ class InputApp(App):
         self.download_fn   = download_fn
         self.direct_download_fn = direct_download_fn
         self.setting_fn    = setting_fn
+        self.filter_fn     = filter_fn
         self.items: list[dict] = []
+        self._all_items: list[dict] = []
         self.selected: int     = 0
         self._last_thumb_url   = ""
         self.focus_mode        = "search"
@@ -329,7 +346,7 @@ class InputApp(App):
         with Container(id="main_grid"):
             with Vertical(id="left"):
                 with Container(id="results_box"):
-                    yield Static("", id="results")
+                    yield RichLog(id="results", auto_scroll=False, highlight=False, markup=True, wrap=True)
                 yield Static("", id="settings_box")
 
             with Vertical(id="right"):
@@ -454,7 +471,7 @@ class InputApp(App):
             self.items = []
             self.selected = 0
             self._last_thumb_url = ""
-            self.query_one("#results", Static).update("")
+            self.query_one("#results", RichLog).clear()
             self._set_thumb_message("[dim]No thumbnail[/dim]")
             self.query_one(Input).disabled = True
             self._fetching = True
@@ -463,7 +480,9 @@ class InputApp(App):
         elif self.direct_download_fn:
             self.query_one(Input).disabled = True
             self.query_one("#msg", Static).update("[yellow]Downloading…[/yellow]")
-            self.query_one("#results", Static).update(f"[#1e90ff]▶ {value}[/#1e90ff]")
+            results = self.query_one("#results", RichLog)
+            results.clear()
+            results.write(f"[#1e90ff]▶ {value}[/#1e90ff]")
             self._set_thumb_message("[dim]No thumbnail[/dim]")
             self._start_direct_download(value)
         else:
@@ -471,6 +490,16 @@ class InputApp(App):
 
     def _run_fetch(self, value: str, generation: int) -> None:
         cancel_event = self._fetch_cancel_event
+
+        if not _has_internet():
+            if cancel_event.is_set() or generation != self._fetch_generation:
+                return
+            self.call_from_thread(
+                self.query_one("#msg", Static).update,
+                "[red]No internet connection.[/red] Please connect to the internet and try again.",
+            )
+            self.call_from_thread(self._unlock_search)
+            return
 
         try:
             kwargs = {}
@@ -527,8 +556,14 @@ class InputApp(App):
         if generation != self._fetch_generation or self._fetch_cancel_event.is_set():
             return
 
-        if not self.items:
-            self.items = results
+        # A fetch may ask the TUI to switch into a sub-mode (e.g. DinoTube
+        # search) instead of showing results. Enter that mode and clear input.
+        if len(results) == 1 and isinstance(results[0], dict) and results[0].get("_enter_mode"):
+            self._enter_search_mode(results[0].get("message", ""))
+            return
+
+        self._all_items = results
+        self._apply_filter()
 
         self._fetching = False
         if not self.items:
@@ -562,21 +597,21 @@ class InputApp(App):
         else:
             visible = range(total)
 
-        lines: list[str] = []
+        results = self.query_one("#results", RichLog)
+        results.clear()
         if total > window and visible.start > 0:
-            lines.append("  [dim]▲ more[/dim]")
+            results.write("[dim]▲ more[/dim]")
         for i in visible:
             item = items[i]
             title = item.get("title", "?") if isinstance(item, dict) else str(item)
             dur   = item.get("duration", "") if isinstance(item, dict) else ""
             dur_s = f"  [{dur}]" if dur else ""
             if i == self.selected:
-                lines.append(f"[#1e90ff]▶ {title}{dur_s}[/#1e90ff]")
+                results.write(f"[#1e90ff]▶ {title}{dur_s}[/#1e90ff]")
             else:
-                lines.append(f"  [white]{title}[/white][dim]{dur_s}[/dim]")
+                results.write(f"  [white]{title}[/white][dim]{dur_s}[/dim]")
         if total > window and visible.stop < total:
-            lines.append("  [dim]▼ more[/dim]")
-        self.query_one("#results", Static).update("\n".join(lines))
+            results.write("[dim]▼ more[/dim]")
         self._trigger_thumb()
         self._refresh_settings()
 
@@ -691,6 +726,18 @@ class InputApp(App):
         elif key == "down":
             self.selected = (self.selected + 1) % len(self.items)
             self._refresh_results()
+        elif key == "pageup":
+            self.selected = max(0, self.selected - 10)
+            self._refresh_results()
+        elif key == "pagedown":
+            self.selected = min(len(self.items) - 1, self.selected + 10)
+            self._refresh_results()
+        elif key == "home":
+            self.selected = 0
+            self._refresh_results()
+        elif key == "end":
+            self.selected = len(self.items) - 1
+            self._refresh_results()
         elif key == "enter":
             self._start_download()
         elif key == "escape":
@@ -792,7 +839,9 @@ class InputApp(App):
 
         self._settings_dirty = True
         self._save_settings_if_needed()
-        self._refresh_settings()
+        # Re-apply any active filter (e.g. DinoTube quality) to the results.
+        self._apply_filter()
+        self._refresh_results()
 
     # ── download ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -840,6 +889,11 @@ class InputApp(App):
         else:
             item = self.items[self.selected]
         status = self.query_one("#status_box", Static)
+
+        if not _has_internet():
+            status.update("[red]No internet connection.[/red] Please connect to the internet and try again.")
+            return
+
         status.update("[yellow]⏳ Starting download…[/yellow]")
         if self.download_fn:
             if self._needs_terminal(self.download_fn):
@@ -855,6 +909,12 @@ class InputApp(App):
 
     def _start_direct_download(self, value: str) -> None:
         status = self.query_one("#status_box", Static)
+
+        if not _has_internet():
+            status.update("[red]No internet connection.[/red] Please connect to the internet and try again.")
+            self._unlock_search()
+            return
+
         status.update("[yellow]⏳ Starting download…[/yellow]")
         item = {"query": value}
         if self._needs_terminal(self.direct_download_fn):
@@ -947,6 +1007,7 @@ class InputApp(App):
         self._refresh_results()
 
     def _replace_results(self, items: list[dict]) -> None:
+        self._all_items = items
         self.items = items
         self.selected = 0
         self._last_thumb_url = ""
@@ -956,15 +1017,56 @@ class InputApp(App):
         )
         self._refresh_results()
 
-    # ── reset ─────────────────────────────────────────────────────────────────
-    def _reset_to_search(self) -> None:
-        self._fetch_cancel_event.set()
-        self._fetch_generation += 1
+    # ── filtering ──────────────────────────────────────────────────────────────
+    def _apply_filter(self) -> None:
+        """Recompute the displayed items from the full set using filter_fn."""
+        if self.filter_fn and self._all_items:
+            try:
+                self.items = self.filter_fn(self._all_items, self.settings_state) or []
+            except Exception:
+                self.items = self._all_items
+        else:
+            self.items = self._all_items
+        self.selected = min(self.selected, len(self.items) - 1) if self.items else 0
+
+    def _reload_settings(self) -> None:
+        """Re-read settings from setting_fn (e.g. after entering a sub-mode)."""
+        if not self.setting_fn:
+            self.settings_state = {}
+            return
+        self.settings_state = self._load_settings_state()
+
+    def _enter_search_mode(self, message: str = "") -> None:
+        """Clear the input and await a fresh query (used by DinoTube trigger)."""
+        self._all_items      = []
         self.items           = []
         self.selected        = 0
         self._last_thumb_url = ""
         self._fetching       = False
-        self.query_one("#results", Static).update("")
+        self.query_one("#results", RichLog).clear()
+        self._set_thumb_message("[dim]No thumbnail[/dim]")
+        self.query_one("#status_box", Static).update("[dim]No download yet.[/dim]")
+        inp = self.query_one(Input)
+        inp.value = ""
+        inp.placeholder = "Search DinoTube…"
+        self.query_one("#msg", Static).update(
+            message or "[green]Search mode — type a query and press Enter[/green]"
+        )
+        self._reload_settings()
+        self.focus_mode = "search"
+        self._refresh_settings()
+        self._unlock_search()
+
+    # ── reset ─────────────────────────────────────────────────────────────────
+    def _reset_to_search(self) -> None:
+        self._fetch_cancel_event.set()
+        self._fetch_generation += 1
+        self._all_items     = []
+        self.items           = []
+        self.selected        = 0
+        self._last_thumb_url = ""
+        self._fetching       = False
+        self.query_one("#results", RichLog).clear()
         self._set_thumb_message("[dim]No thumbnail[/dim]")
         self.query_one("#status_box", Static).update("[dim]No download yet.[/dim]")
         self.query_one("#msg", Static).update(self.msg_text)
@@ -1001,7 +1103,8 @@ def get_input(msg: str = "", old_query: str = "",
               fetch_fn: Callable | None = None,
               download_fn: Callable | None = None,
               direct_download_fn: Callable | None = None,
-              setting_fn: Callable | None = None):
+              setting_fn: Callable | None = None,
+              filter_fn: Callable | None = None):
     """
     Launch the TUI and return whatever the user confirmed.
     If download_fn is provided, downloading happens inside the TUI and
@@ -1010,5 +1113,5 @@ def get_input(msg: str = "", old_query: str = "",
     app = InputApp(msg=msg, old_query=old_query,
                    fetch_fn=fetch_fn, download_fn=download_fn,
                    direct_download_fn=direct_download_fn,
-                   setting_fn=setting_fn)
+                   setting_fn=setting_fn, filter_fn=filter_fn)
     return app.run()
